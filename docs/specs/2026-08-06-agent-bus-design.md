@@ -42,7 +42,8 @@ which is what lets a restarted agent resume rather than replay or miss.
 of truth; the daemon's in-memory index is rebuilt from it on start.
 
 **Retention.** Messages older than **1 hour** are pruned by a sweep every 60s.
-Default replay window for `history` is **30 minutes**.
+The retention window is therefore the outer limit of what `history` can ever
+return.
 
 **Daemon lifetime.** One daemon per OS user, auto-started by whichever command
 needs it first. Exits after **1.5 hours** with all partitions idle — deliberately
@@ -96,7 +97,7 @@ agent-bus post <topic> [message]         publish; reads stdin if message omitted
 agent-bus wait <pattern> --as <id>       block for next unread; print one; exit
 agent-bus read <pattern> --as <id>       drain all unread now, non-blocking
 agent-bus follow <pattern> --as <id>     stream forever, one JSON line per message
-agent-bus history <pattern> --since 30m  replay window, ignores cursor
+agent-bus history <pattern> [--since D]  replay window, ignores cursor
 agent-bus hook install <harness>         write Stop-hook / plugin config
 agent-bus status                         daemon state, partitions, subscribers, lag
 agent-bus stop                           shut down
@@ -107,7 +108,16 @@ Original flag spellings (`--daemon`, `--subscribe`, `--post`) are retained as
 hidden aliases so existing prompt text keeps working.
 
 Global flags: `--json` (all commands), `--timeout <dur>` (`wait`),
-`--priority high|normal` (`post`), `--as <id>` (subscriber commands).
+`--priority high|normal` (`post`), `--as <id>` (subscriber commands),
+`--since <duration>` (`history`).
+
+**`history` defaults to the full retained window.** Omitting `--since` returns
+everything the daemon still holds for the pattern — there is no hidden default
+cutoff, so `history` can never silently truncate. `--since 10m` narrows it. An
+agent reconstructing context after a restart gets all available data by default,
+which is the case history exists to serve. Durations accept `s`/`m`/`h`
+suffixes; a `--since` longer than the retention window is not an error, it just
+returns what survives.
 
 **Exit codes** — the caller is a shell loop or an agent branching on the result:
 
@@ -180,6 +190,8 @@ and snap-forward; ULID ordering.
 - `wait` timeout → exit 2, cursor unmoved
 - retention prune → old messages gone, cursors snapped, no crash
 - killed client mid-delivery → message redelivered, not dropped
+- `history` with no `--since` → returns full retained window, not a subset
+- `history --since` longer than retention → returns survivors, no error
 
 ## Rust practices
 

@@ -110,7 +110,7 @@ code contract. Point your agent's context at it.
 ## Development
 
 ```bash
-cargo test --workspace                      # 113 tests
+cargo test --workspace                      # 134 tests
 cargo clippy --workspace --all-targets      # pedantic, warning-free
 cargo fmt --all -- --check
 ```

@@ -65,7 +65,13 @@ pub fn print_status(status: &StatusReport, json: bool) -> Result<()> {
         for subscriber in &partition.subscribers {
             let flag =
                 if subscriber.snapped { "  (missed messages: pruned past cursor)" } else { "" };
-            println!("  - {} lag={}{}", subscriber.id, subscriber.lag, flag);
+            // The pattern is printed because it is half the cursor key: one
+            // subscriber reading two patterns has two independent positions,
+            // and the id alone would render them as two identical lines.
+            println!(
+                "  - {} [{}] lag={}{}",
+                subscriber.id, subscriber.pattern, subscriber.lag, flag
+            );
         }
     }
     Ok(())

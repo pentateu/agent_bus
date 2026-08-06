@@ -9,7 +9,7 @@ use std::{
     time::Instant,
 };
 
-use agent_bus_core::RetentionPolicy;
+use agent_bus_core::{PartitionName, RetentionPolicy};
 use anyhow::Result;
 
 use crate::partition::Partition;
@@ -44,6 +44,10 @@ impl BusState {
 
     /// Get a partition, opening it from disk the first time it is touched.
     ///
+    /// Takes a validated [`PartitionName`]: opening a partition creates files
+    /// named after it, so the check cannot be optional. Callers holding a
+    /// client-supplied string must go through [`PartitionName::parse`].
+    ///
     /// Written as a single `entry` match so the "just inserted, so the lookup
     /// cannot fail" case is impossible by construction rather than by comment:
     /// there is no second lookup and therefore no panic path in a process that
@@ -51,8 +55,8 @@ impl BusState {
     ///
     /// # Errors
     /// Returns an error if the partition's files cannot be opened.
-    pub fn partition_mut(&mut self, name: &str) -> Result<&mut Partition> {
-        match self.partitions.entry(name.to_owned()) {
+    pub fn partition_mut(&mut self, name: &PartitionName) -> Result<&mut Partition> {
+        match self.partitions.entry(name.as_str().to_owned()) {
             Entry::Occupied(existing) => Ok(existing.into_mut()),
             Entry::Vacant(slot) => {
                 let partition = Partition::open(&self.state_dir, name)?;
@@ -105,17 +109,21 @@ mod tests {
 
     use super::*;
 
+    fn name(s: &str) -> PartitionName {
+        PartitionName::parse(s).unwrap()
+    }
+
     #[test]
     fn partitions_are_created_on_demand_and_reused() {
         let dir = TempDir::new().unwrap();
         let mut state = BusState::new(dir.path().to_path_buf());
 
         assert!(!state.partition_exists("iot_base"));
-        state.partition_mut("iot_base").unwrap();
+        state.partition_mut(&name("iot_base")).unwrap();
         assert!(state.partition_exists("iot_base"));
 
         // Second call must reuse, not recreate.
-        state.partition_mut("iot_base").unwrap();
+        state.partition_mut(&name("iot_base")).unwrap();
         assert_eq!(state.partition_names(), vec!["iot_base".to_owned()]);
     }
 
@@ -132,9 +140,9 @@ mod tests {
             Priority::Normal,
             None,
         );
-        state.partition_mut("iot_base").unwrap().publish(m).unwrap();
+        state.partition_mut(&name("iot_base")).unwrap().publish(m).unwrap();
 
-        let other = state.partition_mut("other_project").unwrap();
+        let other = state.partition_mut(&name("other_project")).unwrap();
         let pattern = Pattern::parse("other_project/**").unwrap();
         assert!(
             other.unread(&pattern, "spy").is_empty(),

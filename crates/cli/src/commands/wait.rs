@@ -23,8 +23,8 @@ pub fn run(
     timeout_secs: Option<u64>,
     json: bool,
 ) -> Result<ExitCode> {
-    // Parsed client-side purely to learn the partition for the ack. The daemon
-    // parses it again authoritatively.
+    // Parsed client-side purely to learn the partition and pattern for the ack.
+    // The daemon parses it again authoritatively.
     let parsed = Pattern::parse(pattern)?;
 
     let mut client = Client::connect()?;
@@ -36,7 +36,7 @@ pub fn run(
 
     match response {
         Response::Messages { messages } => {
-            print_and_ack(&mut client, &messages, parsed.partition(), subscriber, json)?;
+            print_and_ack(&mut client, &messages, &parsed, subscriber, json)?;
             Ok(ExitCode::Success)
         }
         Response::Timeout => {

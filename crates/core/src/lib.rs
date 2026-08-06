@@ -21,5 +21,6 @@ pub mod topic;
 pub use cursor::CursorStore;
 pub use error::CoreError;
 pub use message::{Message, Priority};
+pub use paths::PartitionName;
 pub use retention::{IDLE_SHUTDOWN_SECS, RetentionPolicy};
 pub use topic::{Pattern, Topic};

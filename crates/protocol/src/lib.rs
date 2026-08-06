@@ -48,8 +48,14 @@ pub enum Request {
     Stop,
     /// Acknowledge consumption so the cursor advances. Sent after the client
     /// has successfully written messages out.
+    ///
+    /// Carries the `pattern` as well as the partition because cursors are keyed
+    /// on (subscriber, pattern): without it the daemon cannot tell which of a
+    /// subscriber's read positions this delivery earned, and advancing the
+    /// wrong one silently consumes messages the client never saw.
     Ack {
         partition: String,
+        pattern: String,
         subscriber: String,
         id: String,
     },
@@ -102,6 +108,9 @@ pub struct PartitionReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriberReport {
     pub id: String,
+    /// The pattern this cursor tracks. One subscriber reading two patterns has
+    /// two independent positions and appears once per pattern.
+    pub pattern: String,
     pub cursor: String,
     /// Unread messages behind this cursor.
     pub lag: usize,
@@ -184,6 +193,7 @@ mod tests {
                     oldest_age_secs: Some(120),
                     subscribers: vec![SubscriberReport {
                         id: "reviewer".to_owned(),
+                        pattern: "iot_base/**".to_owned(),
                         cursor: "01J000000000000000000000".to_owned(),
                         lag: 1,
                         snapped: false,
@@ -204,6 +214,7 @@ mod tests {
 
         let ack = Request::Ack {
             partition: "iot_base".to_owned(),
+            pattern: "iot_base/**".to_owned(),
             subscriber: "reviewer".to_owned(),
             id: "01J000000000000000000000".to_owned(),
         };

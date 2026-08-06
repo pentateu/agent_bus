@@ -2,7 +2,7 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use agent_bus_core::{Message, Pattern};
+use agent_bus_core::{IDLE_SHUTDOWN_SECS, Message, PartitionName, Pattern};
 use agent_bus_protocol::{Request, Response, encode};
 use anyhow::{Context, Result};
 use tokio::{
@@ -19,6 +19,19 @@ use crate::{
 /// Default `wait` timeout when the client does not supply one: 30 minutes.
 /// Bounded so a client never blocks forever against a harness tool timeout.
 const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 1800;
+
+/// Hard ceiling on a client-supplied `wait` timeout: 1.5 hours.
+///
+/// Set to [`IDLE_SHUTDOWN_SECS`] because that is the real limit already: the
+/// daemon exits after that long without activity, so a longer wait cannot be
+/// honoured anyway — and by then retention (1 hour) has emptied the log, so
+/// there is nothing left for a longer wait to find.
+///
+/// The clamp exists because the wire value is untrusted. `u64::MAX` seconds
+/// overflowed `Instant + Duration` and panicked the connection task, which
+/// destroyed the connection with no response and made the client exit 1
+/// instead of the documented 2 or 3.
+const MAX_WAIT_TIMEOUT_SECS: u64 = IDLE_SHUTDOWN_SECS;
 
 /// Serve until a stop request or idle shutdown.
 ///
@@ -119,16 +132,32 @@ async fn handle_connection(
             }
 
             Dispatch::WaitPending { partition, pattern, subscriber, timeout_secs } => {
-                let timeout =
-                    Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS));
+                // Clamped rather than rejected: an over-long timeout is a
+                // request to wait "as long as possible", and the ceiling is
+                // what that actually means here.
+                let timeout = Duration::from_secs(
+                    timeout_secs.unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS).min(MAX_WAIT_TIMEOUT_SECS),
+                );
                 let response =
                     wait_for_message(&state, &partition, &pattern, &subscriber, timeout).await;
                 send(&mut write_half, &response).await?;
             }
 
             Dispatch::FollowPending { partition, pattern, subscriber } => {
-                // Streams until the client goes away; errors end the loop.
-                follow(&state, &partition, &pattern, &subscriber, &mut write_half).await?;
+                // Streams until the client goes away. A stream that breaks must
+                // be reported to the client before the connection closes:
+                // previously the error propagated out of here to the daemon's
+                // stderr, which is /dev/null for an auto-started daemon, and
+                // the client saw a bare EOF and reported success.
+                if let Err(e) =
+                    follow(&state, &partition, &pattern, &subscriber, &mut write_half).await
+                {
+                    let response = Response::Error { message: format!("follow failed: {e:#}") };
+                    // Best-effort: if the write also fails the client is
+                    // already gone, which is the ordinary way a follow ends.
+                    let _ = send(&mut write_half, &response).await;
+                    return Err(e);
+                }
                 return Ok(());
             }
         }
@@ -152,18 +181,31 @@ async fn wait_for_message(
     subscriber: &str,
     timeout: Duration,
 ) -> Response {
+    let name = match PartitionName::parse(partition) {
+        Ok(n) => n,
+        Err(e) => return Response::Error { message: e.to_string() },
+    };
+
     // Subscribed before the first log check, so a publish racing this call
     // either lands in the check below or leaves a pending wake-up here. The
     // reverse order has a gap in which both miss.
     let mut notifications = {
         let mut guard = state.lock().await;
-        match guard.partition_mut(partition) {
+        match guard.partition_mut(&name) {
             Ok(p) => p.subscribe_notifications(),
             Err(e) => return Response::Error { message: e.to_string() },
         }
     };
 
-    let deadline = tokio::time::Instant::now() + timeout;
+    // `checked_add` rather than `+`: the caller clamps, but this function is
+    // also reachable from tests and any future caller, and a panic here kills
+    // the whole connection task rather than failing one request. Saturating to
+    // the clamp keeps an absurd duration behaving like the longest legitimate
+    // wait instead of aborting the connection.
+    let now = tokio::time::Instant::now();
+    let deadline = now
+        .checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(MAX_WAIT_TIMEOUT_SECS));
 
     loop {
         // Check before waiting: a message may have landed between dispatch and
@@ -172,7 +214,7 @@ async fn wait_for_message(
         // the await below.
         let found = {
             let mut guard = state.lock().await;
-            match guard.partition_mut(partition) {
+            match guard.partition_mut(&name) {
                 Ok(p) => p.unread(pattern, subscriber).first().map(|m| (*m).clone()),
                 Err(e) => return Response::Error { message: e.to_string() },
             }
@@ -208,9 +250,10 @@ async fn follow(
     subscriber: &str,
     write_half: &mut OwnedWriteHalf,
 ) -> Result<()> {
+    let name = PartitionName::parse(partition)?;
     let mut notifications = {
         let mut guard = state.lock().await;
-        guard.partition_mut(partition)?.subscribe_notifications()
+        guard.partition_mut(&name)?.subscribe_notifications()
     };
 
     loop {
@@ -218,20 +261,17 @@ async fn follow(
         // borrows cannot survive the `send` await below.
         let batch: Vec<Message> = {
             let mut guard = state.lock().await;
-            guard
-                .partition_mut(partition)?
-                .unread(pattern, subscriber)
-                .into_iter()
-                .cloned()
-                .collect()
+            guard.partition_mut(&name)?.unread(pattern, subscriber).into_iter().cloned().collect()
         };
 
         if let Some(last) = batch.last().map(|m| m.id) {
             send(write_half, &Response::Messages { messages: batch }).await?;
             // Advance only after the bytes are out, so a client that dies
-            // mid-write re-reads rather than silently losing messages.
+            // mid-write re-reads rather than silently losing messages. Acked
+            // against this follow's own pattern, so it cannot consume messages
+            // another pattern would have delivered to the same subscriber.
             let mut guard = state.lock().await;
-            guard.partition_mut(partition)?.acknowledge(subscriber, last)?;
+            guard.partition_mut(&name)?.acknowledge(subscriber, pattern.as_str(), last)?;
             continue;
         }
 
@@ -272,6 +312,10 @@ mod tests {
         Pattern::parse("iot_base/**").unwrap()
     }
 
+    fn name(s: &str) -> PartitionName {
+        PartitionName::parse(s).unwrap()
+    }
+
     /// The post-before-subscribe race: the message is already on disk when the
     /// wait begins, so it must come back without any publish to wake it.
     #[tokio::test]
@@ -281,7 +325,7 @@ mod tests {
         state
             .lock()
             .await
-            .partition_mut("iot_base")
+            .partition_mut(&name("iot_base"))
             .unwrap()
             .publish(msg("iot_base/dev_01", "hi"))
             .unwrap();
@@ -307,7 +351,7 @@ mod tests {
         state
             .lock()
             .await
-            .partition_mut("iot_base")
+            .partition_mut(&name("iot_base"))
             .unwrap()
             .publish(msg("iot_base/dev_01", "hi"))
             .unwrap();
@@ -317,7 +361,8 @@ mod tests {
                 .await;
 
         let mut guard = state.lock().await;
-        let unread = guard.partition_mut("iot_base").unwrap().unread(&pattern(), "reviewer").len();
+        let unread =
+            guard.partition_mut(&name("iot_base")).unwrap().unread(&pattern(), "reviewer").len();
         assert_eq!(unread, 1, "wait must not acknowledge; the CLI acks explicitly");
     }
 
@@ -345,7 +390,7 @@ mod tests {
         let state = state(&dir);
         // Open the partition up front so the waiter and the publisher share one
         // broadcast channel rather than racing to create it.
-        state.lock().await.partition_mut("iot_base").unwrap();
+        state.lock().await.partition_mut(&name("iot_base")).unwrap();
 
         let waiter = {
             let state = Arc::clone(&state);
@@ -373,7 +418,7 @@ mod tests {
         state
             .lock()
             .await
-            .partition_mut("iot_base")
+            .partition_mut(&name("iot_base"))
             .unwrap()
             .publish(msg("iot_base/dev_01", "late"))
             .unwrap();

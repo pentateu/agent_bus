@@ -8,7 +8,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_bus_core::{Message, Pattern, Topic};
+use agent_bus_core::{Message, PartitionName, Pattern, Topic};
 use agent_bus_protocol::{PartitionReport, Request, Response, StatusReport, SubscriberReport};
 use ulid::Ulid;
 
@@ -50,11 +50,17 @@ pub fn dispatch(state: &mut BusState, request: Request) -> Dispatch {
                 Ok(p) => p,
                 Err(e) => return Dispatch::Reply(error(&e)),
             };
-            let name = parsed.partition().to_owned();
+            let name = match PartitionName::parse(parsed.partition()) {
+                Ok(n) => n,
+                Err(e) => return Dispatch::Reply(error(&e)),
+            };
             // Sampled before `partition_mut`, which is what creates it.
-            let already_running = state.partition_exists(&name);
+            let already_running = state.partition_exists(name.as_str());
             match state.partition_mut(&name) {
-                Ok(_) => Dispatch::Reply(Response::Ensured { partition: name, already_running }),
+                Ok(_) => Dispatch::Reply(Response::Ensured {
+                    partition: name.as_str().to_owned(),
+                    already_running,
+                }),
                 Err(e) => Dispatch::Reply(error(&e)),
             }
         }
@@ -64,7 +70,10 @@ pub fn dispatch(state: &mut BusState, request: Request) -> Dispatch {
                 Ok(t) => t,
                 Err(e) => return Dispatch::Reply(error(&e)),
             };
-            let name = topic.partition().to_owned();
+            let name = match PartitionName::parse(topic.partition()) {
+                Ok(n) => n,
+                Err(e) => return Dispatch::Reply(error(&e)),
+            };
             let message = Message::new(topic, body, priority, from);
             match state.partition_mut(&name).and_then(|p| p.publish(message)) {
                 Ok(id) => Dispatch::Reply(Response::Posted { id: id.to_string() }),
@@ -123,27 +132,56 @@ pub fn dispatch(state: &mut BusState, request: Request) -> Dispatch {
             }
         }
 
-        // The client names the partition directly here rather than sending a
-        // pattern, but that grants no extra reach: an `ack` only ever moves
-        // that subscriber's own cursor forward, and `CursorStore::advance`
-        // refuses to move one backwards. The worst a wrong partition can do is
-        // skip messages for the naming client itself; no other subscriber's
-        // delivery and no other partition's contents are affected.
-        Request::Ack { partition, subscriber, id } => {
-            let Ok(id) = id.parse::<Ulid>() else {
-                return Dispatch::Reply(Response::Error {
-                    message: format!("invalid cursor id {id:?}"),
-                });
-            };
-            match state.partition_mut(&partition).and_then(|p| p.acknowledge(&subscriber, id)) {
-                Ok(()) => Dispatch::Reply(Response::Ok),
-                Err(e) => Dispatch::Reply(error(&e)),
-            }
+        Request::Ack { partition, pattern, subscriber, id } => {
+            Dispatch::Reply(acknowledge(state, &partition, &pattern, &subscriber, &id))
         }
 
         Request::Status => Dispatch::Reply(Response::Status { status: build_status(state) }),
 
         Request::Stop => Dispatch::Shutdown,
+    }
+}
+
+/// Advance one (subscriber, pattern) cursor.
+///
+/// Every argument is client-supplied and every one is validated here. The
+/// partition in particular: it becomes a file name, and an unvalidated string
+/// once let `../../../../tmp/evil` through into
+/// `state_dir.join(format!("{partition}.jsonl"))`, creating and truncating
+/// files anywhere the daemon's uid could write. `PartitionName::parse` is the
+/// first of two layers — `Partition::open` will not accept a bare string at
+/// all — so the unsafe path is unreachable rather than merely unused.
+fn acknowledge(
+    state: &mut BusState,
+    partition: &str,
+    pattern: &str,
+    subscriber: &str,
+    id: &str,
+) -> Response {
+    let name = match PartitionName::parse(partition) {
+        Ok(n) => n,
+        Err(e) => return error(&e),
+    };
+    // The pattern is half the cursor key, so it is validated too, and checked
+    // to belong to the named partition: a cursor is stored under the pattern
+    // string, so a pattern from another partition would write a position that
+    // partition's own reads could never use.
+    let parsed = match Pattern::parse(pattern) {
+        Ok(p) => p,
+        Err(e) => return error(&e),
+    };
+    if parsed.partition() != name.as_str() {
+        return Response::Error {
+            message: format!("pattern {pattern:?} does not belong to partition {partition:?}"),
+        };
+    }
+    let Ok(id) = id.parse::<Ulid>() else {
+        return Response::Error { message: format!("invalid cursor id {id:?}") };
+    };
+
+    match state.partition_mut(&name).and_then(|p| p.acknowledge(subscriber, parsed.as_str(), id)) {
+        Ok(()) => Response::Ok,
+        Err(e) => error(&e),
     }
 }
 
@@ -156,7 +194,12 @@ fn resolve<'s>(
     pattern: &str,
 ) -> Result<(Pattern, &'s mut Partition), Response> {
     let parsed = Pattern::parse(pattern).map_err(|e| error(&e))?;
-    let partition = state.partition_mut(parsed.partition()).map_err(|e| error(&e))?;
+    // A pattern's first segment is already a single literal non-empty segment,
+    // so this re-validation never rejects a legitimate pattern. It is here so
+    // that the only route to a partition file runs through the same check,
+    // whatever the caller.
+    let name = PartitionName::parse(parsed.partition()).map_err(|e| error(&e))?;
+    let partition = state.partition_mut(&name).map_err(|e| error(&e))?;
     Ok((parsed, partition))
 }
 
@@ -186,6 +229,7 @@ fn build_status(state: &BusState) -> StatusReport {
                 .into_iter()
                 .map(|s| SubscriberReport {
                     id: s.id,
+                    pattern: s.pattern,
                     cursor: s.cursor,
                     lag: s.lag,
                     snapped: s.snapped,

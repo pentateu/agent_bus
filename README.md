@@ -39,8 +39,10 @@ bare partition name means the partition and everything in it. The first segment
 must be a literal — a wildcard there would escape the partition.
 
 **Cursors.** Each subscriber (`--as <id>`, defaulting to the pattern) has its own
-read position. Cursors persist across daemon restarts, so an agent that dies and
-comes back resumes where it left off rather than replaying or missing.
+read position *per pattern*. Reading one pattern therefore never consumes another
+pattern's messages, even under the same id. Cursors persist across daemon
+restarts, so an agent that dies and comes back resumes where it left off rather
+than replaying or missing.
 
 **Retention.** Messages live for 1 hour. The daemon exits after 1.5 hours idle —
 deliberately longer, so by the time it goes the logs hold nothing of value — and

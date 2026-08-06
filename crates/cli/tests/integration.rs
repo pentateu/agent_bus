@@ -800,6 +800,186 @@ fn guide_prints_without_a_daemon() {
     );
 }
 
+/// Regression, CRITICAL 1: acking a message delivered for one pattern must not
+/// consume a message that only a *different* pattern selects.
+///
+/// The cursor used to be keyed on the subscriber alone, so `wait` on
+/// `dev_01` acked an id that sat *after* the earlier `planner` message, and the
+/// subsequent `read` on `planner` seeked straight past it. The message was
+/// unreachable from then on — silent, permanent loss.
+#[test]
+fn acking_one_pattern_does_not_consume_another_patterns_messages() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path();
+
+    // Posted first, so a single per-subscriber cursor set to D1's id would
+    // swallow it.
+    assert_ok(&bus(state, &["post", "iot_base/planner", "P1"]), "post P1");
+    assert_ok(&bus(state, &["post", "iot_base/dev_01", "D1"]), "post D1");
+
+    let waited =
+        bus(state, &["wait", "iot_base/dev_01", "--as", "w1", "--timeout", "5s", "--json"]);
+    assert_ok(&waited, "wait");
+    assert_eq!(bodies(&waited), vec!["D1"]);
+
+    // Same subscriber, different pattern: P1 must still be there.
+    let planner = bus(state, &["read", "iot_base/planner", "--as", "w1", "--json"]);
+    assert_ok(&planner, "read planner");
+    assert_eq!(
+        bodies(&planner),
+        vec!["P1"],
+        "a wait on dev_01 must not consume the planner message"
+    );
+
+    stop(state);
+}
+
+/// The same guarantee for `read`, which acks a whole batch rather than one
+/// message, and across a daemon restart so the per-pattern positions are proven
+/// to persist rather than merely to live in memory.
+#[test]
+fn per_pattern_cursors_survive_a_restart() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path();
+
+    assert_ok(&bus(state, &["post", "iot_base/planner", "P1"]), "post P1");
+    assert_ok(&bus(state, &["post", "iot_base/dev_01", "D1"]), "post D1");
+
+    let dev = bus(state, &["read", "iot_base/dev_01", "--as", "w1", "--json"]);
+    assert_eq!(bodies(&dev), vec!["D1"]);
+    stop(state);
+
+    let planner = bus(state, &["read", "iot_base/planner", "--as", "w1", "--json"]);
+    assert_eq!(bodies(&planner), vec!["P1"], "the unacked pattern survives a restart");
+
+    // And the acked one stays acked, so the restart did not simply lose cursors.
+    let again = bus(state, &["read", "iot_base/dev_01", "--as", "w1", "--json"]);
+    assert!(bodies(&again).is_empty(), "the acked pattern must not be redelivered");
+
+    stop(state);
+}
+
+/// Regression, CRITICAL 2: an `Ack` naming a traversal partition must be
+/// rejected and must create nothing outside the state directory.
+///
+/// The partition string is interpolated into a file name, so an unvalidated
+/// one wrote `<traversal>.jsonl` and `<traversal>.cursors.json` anywhere the
+/// daemon's uid could reach — arbitrary file creation, and truncation via the
+/// temp-file-and-rename in `persist_cursors`.
+///
+/// Driven over a raw socket because the CLI never builds such a request; the
+/// threat is a hostile or buggy client, not this binary.
+#[test]
+fn an_ack_with_a_traversal_partition_is_rejected() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let dir = TempDir::new().unwrap();
+    let state = dir.path();
+    // The escape target lives inside its own TempDir, so a regression writes
+    // somewhere harmless and observable rather than into a shared /tmp path.
+    let outside = TempDir::new().unwrap();
+    let escape = outside.path().join("pwned");
+
+    assert_ok(&bus(state, &["daemon", "iot_base/**"]), "daemon");
+
+    let traversal = format!("../../../..{}", escape.display());
+    let request = serde_json::json!({
+        "type": "ack",
+        "partition": traversal,
+        "pattern": "iot_base/**",
+        "subscriber": "s",
+        "id": "01J000000000000000000000",
+    });
+
+    let mut sock = UnixStream::connect(state.join("agent-bus.sock")).expect("connecting");
+    writeln!(sock, "{request}").expect("writing the ack");
+    sock.flush().unwrap();
+
+    let mut response = String::new();
+    BufReader::new(&sock).read_line(&mut response).expect("reading the response");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&response).expect("the daemon must answer, not drop the connection");
+    assert_eq!(parsed["type"], "error", "a traversal partition must be rejected: {response}");
+
+    // The actual security property: nothing was created outside the state dir.
+    assert!(
+        !outside.path().join("pwned.jsonl").exists(),
+        "the daemon wrote a log outside its state directory"
+    );
+    assert!(
+        !outside.path().join("pwned.cursors.json").exists(),
+        "the daemon wrote cursors outside its state directory"
+    );
+    assert!(
+        std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+        "the daemon created files outside its state directory"
+    );
+
+    stop(state);
+}
+
+/// Regression, CRITICAL 3: an absurd `--timeout` must not kill the connection.
+///
+/// `Instant + Duration` overflowed and panicked the connection task, so the
+/// client saw the socket close with no response and exited 1 — outside the
+/// documented contract, where 1 means a usage error. The daemon clamps the
+/// wire value instead, so this behaves like the longest legitimate wait.
+#[test]
+fn an_enormous_timeout_does_not_kill_the_connection() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path();
+
+    assert_ok(&bus(state, &["daemon", "empty_ns/**"]), "daemon");
+
+    // u64::MAX seconds: the value that used to overflow the deadline. The clamp
+    // means a correct daemon now blocks for real, so this is spawned rather
+    // than run to completion — the bug's signature is an *immediate* exit.
+    let mut child =
+        command(state, &["wait", "empty_ns/**", "--as", "z", "--timeout", "18446744073709551615"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawning wait");
+
+    // A panicking connection task closed the socket at once and the client
+    // exited within milliseconds. Still running after this means it is blocked
+    // on a clamped deadline, which is the fixed behaviour.
+    std::thread::sleep(Duration::from_secs(2));
+    let still_blocked = child.try_wait().expect("polling wait").is_none();
+
+    child.kill().expect("killing wait");
+    let output = child.wait_with_output().expect("reaping wait");
+
+    assert!(
+        still_blocked,
+        "wait exited immediately instead of blocking on a clamped deadline: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("without responding"),
+        "the connection task died instead of clamping: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    stop(state);
+}
+
+/// The clamp must not turn every long wait into an error either: a large but
+/// still-sane timeout behaves exactly like the default, timing out with 2 once
+/// it expires. Run with a short timeout so the test does not block for hours.
+#[test]
+fn a_clamped_timeout_still_times_out_with_exit_code_two() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path();
+
+    assert_ok(&bus(state, &["daemon", "empty_ns/**"]), "daemon");
+    let waited = bus(state, &["wait", "empty_ns/**", "--as", "z", "--timeout", "1s"]);
+    assert_eq!(code(&waited), 2, "a timeout is exit 2: {}", stderr(&waited));
+
+    stop(state);
+}
+
 /// `hook install --dry-run` prints configuration without touching the disk.
 #[test]
 fn hook_install_dry_run_writes_nothing() {

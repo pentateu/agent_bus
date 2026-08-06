@@ -68,10 +68,16 @@ like `dev_*` are not supported; a segment is either a literal, `*`, or `**`.
 
 SUBSCRIBER IDENTITY AND CURSORS
 
-The bus remembers what you have already received. That memory is keyed by a
-subscriber id, and it persists across restarts — kill your terminal, come back
-an hour later, and you resume exactly where you left off rather than re-reading
-everything or missing what arrived while you were gone.
+The bus remembers what you have already received. That memory is keyed by your
+subscriber id AND the pattern you read with, and it persists across restarts —
+kill your terminal, come back an hour later, and you resume exactly where you
+left off rather than re-reading everything or missing what arrived while you
+were gone.
+
+Because the pattern is part of the key, reading one pattern never consumes
+another's messages, even under the same `--as` id. Waiting on
+`iot_base/dev_01` leaves anything on `iot_base/planner` untouched and still
+unread. Each pattern you use has its own independent position.
 
 Your subscriber id defaults to the pattern you subscribe with. So this:
 
@@ -148,10 +154,13 @@ The topic must be concrete. The body may be given as an argument, or piped:
 
 Flags:
 
-    --priority high   a delivery hint for the receiver. The bus does not act on
-                      it; hook adapters render urgent text differently. Use it
-                      for things that should change what the other agent does
-                      next, not for everything.
+    --priority high   a delivery hint for the receiver. The bus does not act
+                      on it and does not deliver it any faster. It travels with
+                      the message: `"priority":"high"` in --json output, and a
+                      leading `!` in human output. Acting on it is the
+                      receiving agent's job. Use it for things that should
+                      change what the other agent does next, not for
+                      everything.
 
     --from NAME       sender name. Defaults to the topic's last segment, which
                       is usually right for inbox-style topics.
@@ -168,6 +177,13 @@ nothing. Use it to check in without committing to a block.
 
 Streams messages continuously until interrupted. Useful for a human watching a
 terminal; rarely what an agent wants, since it never returns.
+
+`follow` CONSUMES what it streams: the cursor advances as messages go out, so
+anything it prints is gone from that subscriber's unread queue for that
+pattern. If you leave a `follow` running under the same `--as` id AND the same
+pattern you use for `wait` or `read`, it will quietly swallow every message
+before those commands ever see one. Give a `follow` its own `--as` id — `--as
+watcher` — whenever another command reads the same pattern.
 
     agent-bus history 'iot_base/**' --since 10m
 
@@ -275,8 +291,10 @@ INSPECTING THE BUS
     agent-bus status
 
 Shows the daemon pid and uptime, and for each partition the message count, the
-age of the oldest message, and every subscriber with its lag — the number of
-messages it has not yet consumed. High lag on your own id means you have work
+age of the oldest message, and one line per subscriber cursor with its lag —
+the number of matching messages it has not yet consumed. Cursors are per
+(subscriber, pattern), so an id that reads two patterns appears once for each,
+shown as `id [pattern] lag=N`. High lag on your own id means you have work
 queued.
 
 A subscriber flagged "missed messages: pruned past cursor" means messages aged

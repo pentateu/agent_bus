@@ -10,7 +10,7 @@ pub mod status;
 pub mod stop;
 pub mod wait;
 
-use agent_bus_core::Message;
+use agent_bus_core::{Message, Pattern};
 use agent_bus_protocol::{Request, Response};
 use anyhow::{Result, bail};
 
@@ -23,12 +23,17 @@ use crate::{client::Client, output};
 /// next time instead of losing it. Shared by `wait` and `read`, which differ
 /// only in the request that produced the batch.
 ///
+/// `pattern` is sent alongside the partition because the daemon keys cursors on
+/// (subscriber, pattern). Acking without it would advance a single per-
+/// subscriber position past messages this pattern never selected, destroying
+/// them for every other pattern the same subscriber reads.
+///
 /// # Errors
 /// Returns an error if rendering fails or the daemon rejects the ack.
 pub fn print_and_ack(
     client: &mut Client,
     messages: &[Message],
-    partition: &str,
+    pattern: &Pattern,
     subscriber: String,
     json: bool,
 ) -> Result<()> {
@@ -36,7 +41,8 @@ pub fn print_and_ack(
 
     if let Some(last) = messages.last() {
         let ack = client.request(&Request::Ack {
-            partition: partition.to_owned(),
+            partition: pattern.partition().to_owned(),
+            pattern: pattern.as_str().to_owned(),
             subscriber,
             id: last.id.to_string(),
         })?;

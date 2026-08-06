@@ -10,8 +10,15 @@ use crate::{cli::ExitCode, client::Client, commands::unexpected, output};
 /// The daemon advances the cursor itself as it writes each batch, so no
 /// client-side ack is sent here; one would be pure redundancy.
 ///
+/// A `follow` only ends normally when the user interrupts it — the daemon
+/// streams indefinitely otherwise. So reaching end of stream means the daemon
+/// went away, and that is reported as a failure rather than success: returning
+/// 0 here once made a broken stream indistinguishable from a clean exit, and
+/// the daemon-side error was going to /dev/null.
+///
 /// # Errors
-/// Returns an error if the daemon reports a failure or the stream breaks.
+/// Returns an error if the daemon reports a failure or the stream ends
+/// unexpectedly.
 pub fn run(pattern: String, subscriber: String, json: bool) -> Result<ExitCode> {
     let mut client = Client::connect()?;
     let first = client.request(&Request::Follow { pattern, subscriber })?;
@@ -25,5 +32,6 @@ pub fn run(pattern: String, subscriber: String, json: bool) -> Result<ExitCode> 
         }
         current = client.read_optional()?;
     }
-    Ok(ExitCode::Success)
+
+    anyhow::bail!("the daemon closed the follow stream unexpectedly")
 }

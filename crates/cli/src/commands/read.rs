@@ -23,7 +23,7 @@ pub fn run(pattern: &str, subscriber: String, json: bool) -> Result<ExitCode> {
 
     match response {
         Response::Messages { messages } => {
-            print_and_ack(&mut client, &messages, parsed.partition(), subscriber, json)?;
+            print_and_ack(&mut client, &messages, &parsed, subscriber, json)?;
             Ok(ExitCode::Success)
         }
         other => Err(unexpected(&other)),

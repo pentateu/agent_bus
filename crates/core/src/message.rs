@@ -8,9 +8,12 @@ use crate::{error::CoreError, topic::Topic};
 
 /// Delivery hint carried with a message.
 ///
-/// The bus does not act on this. Hook adapters render different instruction
-/// text for `High`, which is how "interrupt me" versus "queue it" is expressed
-/// without the daemon knowing anything about agent policy.
+/// The bus does not act on this: a `High` message is stored, matched, and
+/// delivered exactly like a `Normal` one. It is carried through to the
+/// receiver — as `"priority"` in JSON output and a `!` marker in human output
+/// — and deciding what to do about it is the receiving agent's job. Keeping
+/// the policy out of the daemon is deliberate: "interrupt me" versus "queue
+/// it" is a property of the agent, not of the bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Priority {

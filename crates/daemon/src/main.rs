@@ -7,21 +7,18 @@
 mod handler;
 mod log;
 mod partition;
-mod paths;
 mod server;
 mod state;
 mod sweep;
 
 use std::sync::Arc;
 
+use agent_bus_core::paths::{lock_path, socket_path, state_dir_from_env};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use tokio::sync::Mutex;
 
-use crate::{
-    paths::{lock_path, socket_path, state_dir_from_env},
-    state::BusState,
-};
+use crate::state::BusState;
 
 fn main() -> Result<()> {
     let state_dir = state_dir_from_env();

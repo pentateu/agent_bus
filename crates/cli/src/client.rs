@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use agent_bus_core::paths as core_paths;
 use agent_bus_protocol::{Request, Response, decode, encode};
 use anyhow::{Context, Result, bail};
 
@@ -150,23 +151,13 @@ impl Client {
     }
 }
 
-/// Where the daemon socket lives. Mirrors the daemon's own resolution.
+/// Where the daemon socket lives.
+///
+/// Delegates to `agent_bus_core::paths` rather than re-deriving the layout, so
+/// the CLI cannot drift from the daemon it is trying to reach.
 #[must_use]
 pub fn socket_path() -> PathBuf {
-    state_dir().join("agent-bus.sock")
-}
-
-fn state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("AGENT_BUS_STATE_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(dir).join("agent-bus");
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local").join("state").join("agent-bus");
-    }
-    PathBuf::from("/tmp/agent-bus")
+    core_paths::socket_path(&core_paths::state_dir_from_env())
 }
 
 /// Launch the daemon detached.

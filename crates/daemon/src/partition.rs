@@ -9,15 +9,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use agent_bus_core::{CursorStore, Message, Pattern, RetentionPolicy};
+use agent_bus_core::{
+    CursorStore, Message, Pattern, RetentionPolicy,
+    paths::{cursor_path, log_path},
+};
 use anyhow::{Context, Result};
 use tokio::sync::broadcast;
 use ulid::Ulid;
 
-use crate::{
-    log::PartitionLog,
-    paths::{cursor_path, log_path},
-};
+use crate::log::PartitionLog;
 
 /// Capacity of the wake-up channel. Waiters re-scan the log on any signal, so a
 /// lagged receiver is harmless — it just means "check again".

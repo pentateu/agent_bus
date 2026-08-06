@@ -1,7 +1,14 @@
 //! Where daemon state lives on disk.
 //!
-//! Every path the daemon touches is derived here, so there is exactly one
-//! place that knows the layout of the state directory.
+//! Every path either process touches is derived here, so there is exactly one
+//! place that knows the layout of the state directory. The socket path in
+//! particular is a cross-process contract: if the daemon and the CLI computed
+//! it separately they could drift, and the only symptom would be the CLI
+//! timing out against a socket nobody ever bound.
+//!
+//! These are pure path computations — they read the environment but never
+//! touch the filesystem. Creating, opening, and locking these paths is the
+//! caller's job.
 
 use std::path::{Path, PathBuf};
 
@@ -64,6 +71,21 @@ pub fn cursor_path(state_dir: &Path, partition: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wrapper reads three specific variables; a typo in any of them would
+    /// send the CLI and the daemon to different sockets. Asserted against
+    /// `resolve_state_dir` on the ambient environment rather than by setting
+    /// variables, because mutating the environment is unsound once other tests
+    /// are running in parallel threads.
+    #[test]
+    fn env_wrapper_reads_the_variables_the_pure_resolver_expects() {
+        let expected = resolve_state_dir(
+            std::env::var_os("AGENT_BUS_STATE_DIR").map(PathBuf::from),
+            std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+            std::env::var_os("HOME").map(PathBuf::from),
+        );
+        assert_eq!(state_dir_from_env(), expected);
+    }
 
     #[test]
     fn state_dir_prefers_explicit_override() {

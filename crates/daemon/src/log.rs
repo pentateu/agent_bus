@@ -287,15 +287,16 @@ mod tests {
         log.append(&old).unwrap();
         log.append(&fresh).unwrap();
 
-        // Pretend "now" is far enough ahead that `old` ages out but `fresh`
-        // does not, by using a tiny window and a doctored clock.
-        let now = fresh.id.timestamp_ms() / 1000;
-        let policy = RetentionPolicy { max_age_secs: 1 };
-        // Both were created in the same second, so nothing should be pruned yet.
-        let outcome = log.prune(&policy, now).unwrap();
-        assert_eq!(outcome.removed, 0);
+        // Anchor "now" to the older message and use the default 1-hour window,
+        // so this phase cannot depend on whether the two constructor calls
+        // straddled a wall-clock second boundary.
+        let now = old.id.timestamp_ms() / 1000;
+        let outcome = log.prune(&RetentionPolicy::default(), now).unwrap();
+        assert_eq!(outcome.removed, 0, "nothing is old enough to prune yet");
 
-        // Advance the clock past the window: everything ages out.
+        // Advance the clock well past a tiny window: everything ages out.
+        let policy = RetentionPolicy { max_age_secs: 1 };
+        let now = fresh.id.timestamp_ms() / 1000;
         let outcome = log.prune(&policy, now + 10).unwrap();
         assert_eq!(outcome.removed, 2);
         assert!(log.messages().is_empty());

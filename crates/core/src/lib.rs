@@ -6,10 +6,14 @@
 //! a pure function or plain data, which keeps the interesting logic testable
 //! without sockets or temp directories.
 
+pub mod cursor;
 pub mod error;
 pub mod message;
+pub mod retention;
 pub mod topic;
 
+pub use cursor::CursorStore;
 pub use error::CoreError;
 pub use message::{Message, Priority};
+pub use retention::{IDLE_SHUTDOWN_SECS, RetentionPolicy};
 pub use topic::{Pattern, Topic};

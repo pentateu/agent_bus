@@ -666,6 +666,23 @@ fn a_missing_daemon_binary_exits_three() {
 /// `post` with no body reads it from stdin, which is what shell pipelines and
 /// harness hooks rely on.
 #[test]
+fn an_empty_body_is_rejected_the_same_way_from_either_source() {
+    // An empty argument used to post successfully while empty stdin errored.
+    // Same intent, same mistake, so it must produce the same outcome; an empty
+    // message carries no information and is never what the caller meant.
+    let dir = TempDir::new().unwrap();
+    let state = dir.path();
+
+    let from_arg = bus(state, &["post", "iot_base/dev_01", ""]);
+    assert_eq!(code(&from_arg), 1, "an empty argument body must be rejected");
+
+    let nothing_posted = bus(state, &["history", "iot_base/**"]);
+    assert!(stdout(&nothing_posted).trim().is_empty(), "the rejected post must not be stored");
+
+    stop(state);
+}
+
+#[test]
 fn post_reads_the_body_from_stdin_when_omitted() {
     use std::io::Write;
 

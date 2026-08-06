@@ -21,6 +21,12 @@ pub fn run(
     json: bool,
 ) -> Result<ExitCode> {
     let body = match message {
+        // Rejected here as well as in `body_from_stdin` so the two ways of
+        // supplying a body behave the same: an empty message carries nothing
+        // and is a mistake either way, not a valid post.
+        Some(body) if body.is_empty() => {
+            anyhow::bail!("message body must not be empty");
+        }
         Some(body) => body,
         None => body_from_stdin()?,
     };

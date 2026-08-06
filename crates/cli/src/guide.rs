@@ -84,8 +84,15 @@ Your subscriber id defaults to the pattern you subscribe with. So this:
     agent-bus wait 'iot_base/**'
 
 uses the id "iot_base/**" and needs no flag at all. But if TWO agents both
-watch `iot_base/**`, they would share one cursor and steal each other's
-messages. Give them distinct identities:
+watch `iot_base/**`, they share one cursor, and what happens then is worth
+knowing exactly. Delivery is AT-LEAST-ONCE: the cursor advances only after a
+message has been printed, so nothing is lost to a crash mid-print. The cost is
+that two agents blocked on the same id at the same moment BOTH receive the
+same message and both act on it — two reviewers reviewing the same commit,
+two agents making the same fix. Read one after the other instead and the
+second sees nothing, because the first already consumed it.
+
+Neither outcome is what you want. Give them distinct identities:
 
     agent-bus wait 'iot_base/**' --as reviewer_01
     agent-bus wait 'iot_base/**' --as reviewer_02
@@ -127,11 +134,18 @@ self-terminating:
 
 2. HOOK DELIVERY — when you want to keep working and be told as you go
 
-    agent-bus hook install claude-code 'iot_base/**' --as dev_01
-    agent-bus hook install opencode 'iot_base/**' --as dev_01
+    agent-bus hook install opencode 'iot_base/**' --as dev_01     writes a file
+    agent-bus hook install claude-code 'iot_base/**' --as dev_01  prints config
 
 This wires your harness to drain unread messages at turn boundaries and inject
 them into your context, so you receive things without ever blocking.
+
+The two harnesses differ, and it matters. `opencode` writes its plugin and is
+live immediately. `claude-code` only PRINTS a config block: settings.json is a
+hand-edited file that may hold other tools' hooks, so a human has to paste it
+in. Until they do, you will receive nothing this way. If you ran the
+claude-code line yourself, do not assume delivery is active — say the config
+needs pasting, and use `wait` meanwhile, which needs no setup.
 
 Be clear about the guarantee: NEITHER Claude Code NOR OpenCode can interrupt an
 agent in the middle of a tool call. Nothing will stop you mid-edit. The real

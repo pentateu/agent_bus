@@ -67,14 +67,31 @@ fn install_claude_code(
     // settings.json is shared with every other hook the user has configured,
     // and blindly rewriting it would silently drop them.
     let path = claude_settings_path()?;
-    println!("Add the following to {}:\n", path.display());
+    // Deliberately does not write. settings.json is a live, hand-edited file
+    // that may hold hooks from other tools, and a merge that guesses wrong
+    // costs the user more than the typing it saves. Say so plainly instead:
+    // the caller is usually an agent, and it must not conclude that delivery
+    // is now active when a human still has to act.
+    println!("NOT INSTALLED YET — this prints the config; a human must paste it.\n");
+    println!("Merge the following into {}:\n", path.display());
     println!("{rendered}");
     println!(
-        "\nMerge this into the existing \"hooks\" object rather than replacing it, \
-         so other hooks keep working."
+        "\nMerge it into any existing \"hooks\" object rather than replacing that \
+         object, so hooks from other tools keep working.\n\
+         \n\
+         Until this is pasted in, hook delivery is NOT active and you will not \
+         receive messages this way. `agent-bus wait` needs no setup and works now."
     );
     if json {
-        println!("{}", serde_json::json!({ "harness": "claude-code", "path": path }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "harness": "claude-code",
+                "path": path,
+                "installed": false,
+                "action_required": "a human must merge the printed config into settings.json"
+            })
+        );
     }
     Ok(ExitCode::Success)
 }

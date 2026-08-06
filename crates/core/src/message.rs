@@ -208,4 +208,3 @@ mod tests {
         assert!(ts.starts_with(&format!("{year:04}-")), "unexpected year in {ts:?}");
     }
 }
-

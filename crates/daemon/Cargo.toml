@@ -5,5 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "agent-bus-daemon"
+path = "src/main.rs"
+
+[dependencies]
+agent-bus-core = { workspace = true }
+agent-bus-protocol = { workspace = true }
+anyhow = { workspace = true }
+fs2 = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true

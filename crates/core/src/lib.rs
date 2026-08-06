@@ -7,7 +7,9 @@
 //! without sockets or temp directories.
 
 pub mod error;
+pub mod message;
 pub mod topic;
 
 pub use error::CoreError;
+pub use message::{Message, Priority};
 pub use topic::{Pattern, Topic};

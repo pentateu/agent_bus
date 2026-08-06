@@ -5,9 +5,15 @@
 // Consumed by the request handler and server loop in Tasks 7-8; until then the
 // binary itself calls none of it.
 #[allow(dead_code)]
+mod handler;
+#[allow(dead_code)]
 mod log;
 #[allow(dead_code)]
+mod partition;
+#[allow(dead_code)]
 mod paths;
+#[allow(dead_code)]
+mod state;
 
 // The stub cannot fail yet, but the server loop in Task 8 replaces this body
 // with fallible startup (lock acquisition, socket bind); keeping the signature

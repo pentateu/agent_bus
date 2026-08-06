@@ -61,7 +61,8 @@ impl BusState {
         }
     }
 
-    #[must_use]
+    /// Names of the currently-open partitions, for assertions.
+    #[cfg(test)]
     pub fn partition_names(&self) -> Vec<String> {
         self.partitions.keys().cloned().collect()
     }
@@ -82,11 +83,6 @@ impl BusState {
     #[must_use]
     pub fn uptime_secs(&self) -> u64 {
         self.started.elapsed().as_secs()
-    }
-
-    #[must_use]
-    pub fn policy(&self) -> RetentionPolicy {
-        self.policy
     }
 
     /// Prune every partition. Returns the total number of messages removed.

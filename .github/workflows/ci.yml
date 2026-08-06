@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Keep this version in step with rust-toolchain.toml. The action requires
+      # an explicit toolchain, so the pin is stated in both places.
+      - uses: dtolnay/rust-toolchain@1.97
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Integration tests exec the built binaries, so they must exist first.
+      - run: cargo build --workspace
+      - run: cargo test --workspace

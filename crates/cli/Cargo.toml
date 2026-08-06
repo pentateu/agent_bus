@@ -5,5 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "agent-bus"
+path = "src/main.rs"
+
+[dependencies]
+agent-bus-core = { workspace = true }
+agent-bus-protocol = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+humantime = { workspace = true }
+serde_json = { workspace = true }
+
+# `serde_json` is already a normal dependency and is therefore in scope for
+# unit tests too, so it is deliberately not repeated here.
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true

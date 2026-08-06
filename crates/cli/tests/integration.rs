@@ -361,6 +361,30 @@ fn invalid_input_exits_one() {
     stop(state);
 }
 
+#[test]
+fn argument_errors_exit_one_not_two() {
+    // clap's default for an argument error is 2, which is our "wait timed out"
+    // code. If that leaked through, `while agent-bus wait ...; do ...; done`
+    // would treat a typo'd flag as a clean timeout and exit silently. Exit 2
+    // must mean exactly one thing.
+    let dir = TempDir::new().unwrap();
+    let state = dir.path();
+
+    for args in [
+        vec!["notacommand"],
+        vec!["post"], // missing required topic
+        vec!["post", "iot_base/x", "b", "--priority", "urgent"], // not a valid value
+        vec!["wait", "iot_base/**", "--nonexistent-flag"],
+    ] {
+        let out = bus(state, &args);
+        assert_eq!(code(&out), 1, "argument error must exit 1, got {:?} for {args:?}", code(&out));
+    }
+
+    // Help and version are successful requests, not errors.
+    assert_eq!(code(&bus(state, &["--help"])), 0);
+    assert_eq!(code(&bus(state, &["--version"])), 0);
+}
+
 /// `stop` must never resurrect a daemon in order to kill it: a state directory
 /// that has never seen one stays empty of a socket afterwards.
 #[test]

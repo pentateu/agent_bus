@@ -16,7 +16,23 @@ use crate::{
 };
 
 fn main() {
-    let args = Cli::parse();
+    // clap exits 2 by default on an argument error, which collides with our
+    // documented "wait timed out" code. A shell loop written as
+    // `while agent-bus wait ...; do ...; done` would then treat a typo'd flag
+    // as a clean timeout and exit silently. Remap argument errors to 1 so 2
+    // means exactly one thing.
+    let args = match Cli::try_parse() {
+        Ok(args) => args,
+        Err(error) => {
+            let _ = error.print();
+            std::process::exit(match error.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                    ExitCode::Success.code()
+                }
+                _ => ExitCode::Usage.code(),
+            });
+        }
+    };
     match run(args) {
         Ok(code) => std::process::exit(code.code()),
         Err(error) => {

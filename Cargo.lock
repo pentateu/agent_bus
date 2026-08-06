@@ -23,6 +23,11 @@ version = "0.1.0"
 [[package]]
 name = "agent-bus-protocol"
 version = "0.1.0"
+dependencies = [
+ "agent-bus-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "bumpalo"

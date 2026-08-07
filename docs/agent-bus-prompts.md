@@ -18,17 +18,24 @@ starts the daemon automatically.
 - A **pattern** is a topic with wildcards, used only for RECEIVING:
   `myproj/*` (exactly one more segment), `myproj/**` (one or more), bare
   `myproj` (everything in the partition). Posting always uses a concrete topic.
-- The bus remembers what you read per pattern, keyed by your `--as <id>`.
-  Cursors survive restarts; reading one pattern never consumes another's.
-  Always use the SAME stable `--as` id for the same pattern, and a DISTINCT id
-  per agent. If two agents share one id on a pattern, both can get the same
-  message.
-- Messages are retained ~1h, then pruned. The daemon auto-stops after 1.5h
-  idle and auto-restarts on any command. Nothing to manage.
+- **Delivery is exclusive per pattern.** Each pattern has one position, shared
+  by every consumer that reads with it. The first consumer to read a message
+  takes it, and it is never delivered again — not to them, not to anyone else.
+  So a pool of workers sharing one pattern splits the work automatically:
+  first-to-pick-up wins, no claims needed. `--as` is just a label for `status`;
+  it does NOT create a second copy. If two agents must BOTH see a message,
+  post it with `--broadcast` instead, or give each agent its own inbox pattern.
+- **Broadcast.** `agent-bus post <topic> "..." --broadcast` delivers the message
+  to every consumer (distinct `--as` label) whose pattern matches, each getting
+  their own copy once. Use it for announcements every agent should see.
+- `history` ignores positions and replays past messages — the only way to see a
+  delivered message again. Messages are retained ~1h, then pruned. The daemon
+  auto-stops after 1.5h idle and auto-restarts on any command. Nothing to manage.
 
 Commands:
 
-    agent-bus post <topic> "body"                       post a message
+    agent-bus post <topic> "body"                       post a message (exclusive)
+    agent-bus post <topic> "body" --broadcast           post to every matching consumer
     agent-bus wait '<pattern>' --as <id> --timeout 30m  block until ONE message; exits 2 on timeout
     agent-bus read '<pattern>' --as <id>                print all unread, exit immediately
     agent-bus history '<pattern>' --since 10m           replay, ignores cursors (always safe)
@@ -96,21 +103,14 @@ number ("you are reviewer1 and you review for dev1"), your topics become
 
     agent-bus wait '<project>/review' --as reviewerN --timeout 30m
 
-**Pool mode (shared channel, several reviewers).** Every reviewer with its own
-`--as` gets its own copy of each request, so the first to pick it up wins:
-
-1. When a request arrives, first check whether another reviewer already
-   claimed it: `agent-bus history '<project>/review' --since 5m` — look for a
-   `claim:` message naming the same branch. If claimed, skip and keep waiting.
-2. Otherwise post your claim IMMEDIATELY, before reviewing:
-   `agent-bus post <project>/review "claim: <branch> — <topic> by reviewerN"`
-   Other reviewers will see it and back off.
-3. Ignore `claim:` messages you receive yourself — they are coordination, not
-   work; keep waiting.
+**Pool mode (shared channel, several reviewers).** Delivery is exclusive per
+pattern, so no coordination is needed: the bus hands each message to exactly
+one reviewer — the first one whose `wait` wakes. A review request is delivered
+once and never shown to another reviewer. Just loop: receive a request, review
+it, report back, block again.
 
 **Reviewing.** Perform the review on the stated branch/scope. Verify what you
-report; don't take claims on faith. You do not modify production files — your
-only output is the findings.
+report. You do not modify production files — your only output is the findings.
 
 **Outcome.** At the end, post a short summary to the requesting dev's inbox:
 
@@ -140,7 +140,8 @@ needed:
 | reviewer | replies to `<project>/dev` | `<project>/devN` (paired)    |
 
 - Number matching is the pairing rule: dev1 ↔ reviewer1, dev2 ↔ reviewer2.
-- Use `--as devN` / `--as reviewerN` as your subscriber id so your cursor is
-  continuous.
+- Use `--as devN` / `--as reviewerN` as your label so `status` is readable.
+  Labels do not create delivery positions: with exclusive delivery the pattern
+  is the position, so two agents sharing a pattern compete for each message.
 - No directive given ⇒ default topics ⇒ pool mode on `<project>/review`:
-  first reviewer to claim a request does the job.
+  the bus delivers each request to exactly one reviewer, first to wake wins.

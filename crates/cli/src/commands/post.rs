@@ -18,6 +18,7 @@ pub fn run(
     message: Option<String>,
     priority: &str,
     from: Option<String>,
+    broadcast: bool,
     json: bool,
 ) -> Result<ExitCode> {
     let body = match message {
@@ -35,7 +36,7 @@ pub fn run(
     let priority = if priority == "high" { Priority::High } else { Priority::Normal };
 
     let mut client = Client::connect()?;
-    let response = client.request(&Request::Post { topic, body, priority, from })?;
+    let response = client.request(&Request::Post { topic, body, priority, from, broadcast })?;
 
     match response {
         Response::Posted { id } => {

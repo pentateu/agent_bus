@@ -21,22 +21,34 @@ pub enum Request {
         body: String,
         priority: Priority,
         from: Option<String>,
+        /// Broadcast this message to every consumer (distinct `--as` label)
+        /// whose pattern matches the topic, each getting their own copy once.
+        /// Normal messages are exclusive per pattern.
+        #[serde(default)]
+        broadcast: bool,
     },
-    /// Block until a message newer than the subscriber's cursor is available.
+    /// Block until a message newer than the pattern's position is available.
+    ///
+    /// `label` is the `--as` name, shown in `status` and used for nothing else:
+    /// delivery is exclusive per pattern, so it does not create a position.
     Wait {
         pattern: String,
-        subscriber: String,
+        label: String,
         timeout_secs: Option<u64>,
     },
     /// Return everything unread right now, without blocking.
+    ///
+    /// `label` is the `--as` name, shown in `status` and used for nothing else.
     Read {
         pattern: String,
-        subscriber: String,
+        label: String,
     },
     /// Stream messages indefinitely.
+    ///
+    /// `label` is the `--as` name, shown in `status` and used for nothing else.
     Follow {
         pattern: String,
-        subscriber: String,
+        label: String,
     },
     /// Replay a time window, ignoring the cursor. `since_secs: None` means the
     /// full retained window.
@@ -46,19 +58,6 @@ pub enum Request {
     },
     Status,
     Stop,
-    /// Acknowledge consumption so the cursor advances. Sent after the client
-    /// has successfully written messages out.
-    ///
-    /// Carries the `pattern` as well as the partition because cursors are keyed
-    /// on (subscriber, pattern): without it the daemon cannot tell which of a
-    /// subscriber's read positions this delivery earned, and advancing the
-    /// wrong one silently consumes messages the client never saw.
-    Ack {
-        partition: String,
-        pattern: String,
-        subscriber: String,
-        id: String,
-    },
 }
 
 /// A daemon response.
@@ -100,22 +99,29 @@ pub struct PartitionReport {
     pub name: String,
     pub message_count: usize,
     pub oldest_age_secs: Option<u64>,
-    pub subscribers: Vec<SubscriberReport>,
+    /// One line per pattern delivery position.
+    pub patterns: Vec<PatternReport>,
     /// Corrupt log lines skipped at load time. Surfaced rather than swallowed.
     pub skipped_records: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubscriberReport {
-    pub id: String,
-    /// The pattern this cursor tracks. One subscriber reading two patterns has
-    /// two independent positions and appears once per pattern.
-    pub pattern: String,
+pub struct PatternReport {
+    /// The position key: a pattern string for exclusive delivery, a consumer
+    /// label for broadcast delivery.
+    pub key: String,
+    /// The most recent `--as` label used with this pattern, if any. A label is
+    /// a name, never an exclusive delivery identity: it does not create a
+    /// second exclusive position.
+    pub label: String,
+    /// True when this is a broadcast (per-label) position rather than an
+    /// exclusive (per-pattern) position.
+    pub broadcast: bool,
     pub cursor: String,
     /// Unread messages behind this cursor.
     pub lag: usize,
-    /// True if this cursor was dragged forward by pruning, meaning the
-    /// subscriber provably missed messages.
+    /// True if this cursor was dragged forward by pruning, meaning messages
+    /// provably missed.
     pub snapped: bool,
 }
 
@@ -146,6 +152,7 @@ mod tests {
             body: "ready".to_owned(),
             priority: Priority::High,
             from: Some("dev_01".to_owned()),
+            broadcast: true,
         };
         let line = encode(&req).unwrap();
         assert!(!line.contains('\n'));
@@ -191,9 +198,10 @@ mod tests {
                     name: "iot_base/dev_01".to_owned(),
                     message_count: 3,
                     oldest_age_secs: Some(120),
-                    subscribers: vec![SubscriberReport {
-                        id: "reviewer".to_owned(),
-                        pattern: "iot_base/**".to_owned(),
+                    patterns: vec![PatternReport {
+                        key: "iot_base/**".to_owned(),
+                        label: "reviewer".to_owned(),
+                        broadcast: false,
                         cursor: "01J000000000000000000000".to_owned(),
                         lag: 1,
                         snapped: false,
@@ -207,18 +215,9 @@ mod tests {
     }
 
     #[test]
-    fn ensure_and_ack_requests_roundtrip() {
+    fn ensure_request_roundtrips() {
         let ensure = Request::Ensure { pattern: "iot_base/*".to_owned() };
         let line = encode(&ensure).unwrap();
         assert_eq!(decode::<Request>(&line).unwrap(), ensure);
-
-        let ack = Request::Ack {
-            partition: "iot_base".to_owned(),
-            pattern: "iot_base/**".to_owned(),
-            subscriber: "reviewer".to_owned(),
-            id: "01J000000000000000000000".to_owned(),
-        };
-        let line = encode(&ack).unwrap();
-        assert_eq!(decode::<Request>(&line).unwrap(), ack);
     }
 }

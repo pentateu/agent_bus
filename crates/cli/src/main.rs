@@ -61,8 +61,8 @@ fn run(args: Cli) -> anyhow::Result<ExitCode> {
     match args.command {
         Command::Daemon { pattern } => commands::daemon::run(pattern, json),
 
-        Command::Post { topic, message, priority, from } => {
-            commands::post::run(topic, message, &priority, from, json)
+        Command::Post { topic, message, priority, from, broadcast } => {
+            commands::post::run(topic, message, &priority, from, broadcast, json)
         }
 
         Command::Wait { pattern, as_id, timeout } => {

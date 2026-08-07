@@ -9,8 +9,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_bus_core::{Message, PartitionName, Pattern, Topic};
-use agent_bus_protocol::{PartitionReport, Request, Response, StatusReport, SubscriberReport};
-use ulid::Ulid;
+use agent_bus_protocol::{PartitionReport, PatternReport, Request, Response, StatusReport};
 
 use crate::{partition::Partition, state::BusState};
 
@@ -29,14 +28,9 @@ pub enum Dispatch {
     /// Send this response and continue.
     Reply(Response),
     /// A `Wait` that found nothing: the server must block, then retry.
-    WaitPending {
-        partition: String,
-        pattern: Pattern,
-        subscriber: String,
-        timeout_secs: Option<u64>,
-    },
+    WaitPending { partition: String, pattern: Pattern, label: String, timeout_secs: Option<u64> },
     /// A `Follow`: the server streams until the client disconnects.
-    FollowPending { partition: String, pattern: Pattern, subscriber: String },
+    FollowPending { partition: String, pattern: Pattern, label: String },
     /// Shut the daemon down after replying.
     Shutdown,
 }
@@ -65,7 +59,7 @@ pub fn dispatch(state: &mut BusState, request: Request) -> Dispatch {
             }
         }
 
-        Request::Post { topic, body, priority, from } => {
+        Request::Post { topic, body, priority, from, broadcast } => {
             let topic = match Topic::parse(&topic) {
                 Ok(t) => t,
                 Err(e) => return Dispatch::Reply(error(&e)),
@@ -74,47 +68,49 @@ pub fn dispatch(state: &mut BusState, request: Request) -> Dispatch {
                 Ok(n) => n,
                 Err(e) => return Dispatch::Reply(error(&e)),
             };
-            let message = Message::new(topic, body, priority, from);
+            let mut message = Message::new(topic, body, priority, from);
+            if broadcast {
+                message = message.broadcast();
+            }
             match state.partition_mut(&name).and_then(|p| p.publish(message)) {
                 Ok(id) => Dispatch::Reply(Response::Posted { id: id.to_string() }),
                 Err(e) => Dispatch::Reply(error(&e)),
             }
         }
 
-        Request::Wait { pattern, subscriber, timeout_secs } => {
+        Request::Wait { pattern, label, timeout_secs } => {
             let (pattern, partition) = match resolve(state, &pattern) {
                 Ok(pair) => pair,
                 Err(response) => return Dispatch::Reply(response),
             };
             // A matching message may already have been posted before this wait
-            // began. Answering from the log here, rather than only listening
-            // for the next publish, is what makes the post-then-subscribe race
-            // safe.
-            if let Some(first) = partition.unread(&pattern, &subscriber).first() {
-                Dispatch::Reply(Response::Messages { messages: vec![(*first).clone()] })
-            } else {
-                Dispatch::WaitPending {
+            // began. Delivery is exclusive: handing it out here advances the
+            // pattern's position immediately, so a concurrent waiter cannot
+            // also receive it.
+            match partition.deliver(&pattern, &label, 1) {
+                Ok(batch) if batch.is_empty() => Dispatch::WaitPending {
                     partition: partition.name().to_owned(),
                     pattern,
-                    subscriber,
+                    label,
                     timeout_secs,
-                }
+                },
+                Ok(batch) => Dispatch::Reply(Response::Messages { messages: batch }),
+                Err(e) => Dispatch::Reply(error(&e)),
             }
         }
 
-        Request::Read { pattern, subscriber } => match resolve(state, &pattern) {
-            Ok((pattern, partition)) => Dispatch::Reply(Response::Messages {
-                messages: partition.unread(&pattern, &subscriber).into_iter().cloned().collect(),
-            }),
+        Request::Read { pattern, label } => match resolve(state, &pattern) {
+            Ok((pattern, partition)) => match partition.deliver(&pattern, &label, usize::MAX) {
+                Ok(messages) => Dispatch::Reply(Response::Messages { messages }),
+                Err(e) => Dispatch::Reply(error(&e)),
+            },
             Err(response) => Dispatch::Reply(response),
         },
 
-        Request::Follow { pattern, subscriber } => match resolve(state, &pattern) {
-            Ok((pattern, partition)) => Dispatch::FollowPending {
-                partition: partition.name().to_owned(),
-                pattern,
-                subscriber,
-            },
+        Request::Follow { pattern, label } => match resolve(state, &pattern) {
+            Ok((pattern, partition)) => {
+                Dispatch::FollowPending { partition: partition.name().to_owned(), pattern, label }
+            }
             Err(response) => Dispatch::Reply(response),
         },
 
@@ -132,56 +128,9 @@ pub fn dispatch(state: &mut BusState, request: Request) -> Dispatch {
             }
         }
 
-        Request::Ack { partition, pattern, subscriber, id } => {
-            Dispatch::Reply(acknowledge(state, &partition, &pattern, &subscriber, &id))
-        }
-
         Request::Status => Dispatch::Reply(Response::Status { status: build_status(state) }),
 
         Request::Stop => Dispatch::Shutdown,
-    }
-}
-
-/// Advance one (subscriber, pattern) cursor.
-///
-/// Every argument is client-supplied and every one is validated here. The
-/// partition in particular: it becomes a file name, and an unvalidated string
-/// once let `../../../../tmp/evil` through into
-/// `state_dir.join(format!("{partition}.jsonl"))`, creating and truncating
-/// files anywhere the daemon's uid could write. `PartitionName::parse` is the
-/// first of two layers — `Partition::open` will not accept a bare string at
-/// all — so the unsafe path is unreachable rather than merely unused.
-fn acknowledge(
-    state: &mut BusState,
-    partition: &str,
-    pattern: &str,
-    subscriber: &str,
-    id: &str,
-) -> Response {
-    let name = match PartitionName::parse(partition) {
-        Ok(n) => n,
-        Err(e) => return error(&e),
-    };
-    // The pattern is half the cursor key, so it is validated too, and checked
-    // to belong to the named partition: a cursor is stored under the pattern
-    // string, so a pattern from another partition would write a position that
-    // partition's own reads could never use.
-    let parsed = match Pattern::parse(pattern) {
-        Ok(p) => p,
-        Err(e) => return error(&e),
-    };
-    if parsed.partition() != name.as_str() {
-        return Response::Error {
-            message: format!("pattern {pattern:?} does not belong to partition {partition:?}"),
-        };
-    }
-    let Ok(id) = id.parse::<Ulid>() else {
-        return Response::Error { message: format!("invalid cursor id {id:?}") };
-    };
-
-    match state.partition_mut(&name).and_then(|p| p.acknowledge(subscriber, parsed.as_str(), id)) {
-        Ok(()) => Response::Ok,
-        Err(e) => error(&e),
     }
 }
 
@@ -224,12 +173,13 @@ fn build_status(state: &BusState) -> StatusReport {
             message_count: p.message_count(),
             oldest_age_secs: p.oldest_age_secs(now),
             skipped_records: p.skipped_records(),
-            subscribers: p
-                .subscriber_snapshots()
+            patterns: p
+                .pattern_snapshots()
                 .into_iter()
-                .map(|s| SubscriberReport {
-                    id: s.id,
-                    pattern: s.pattern,
+                .map(|s| PatternReport {
+                    key: s.key,
+                    label: s.label,
+                    broadcast: s.broadcast,
                     cursor: s.cursor,
                     lag: s.lag,
                     snapped: s.snapped,

@@ -38,11 +38,14 @@ one machine without ever seeing each other's traffic.
 bare partition name means the partition and everything in it. The first segment
 must be a literal — a wildcard there would escape the partition.
 
-**Cursors.** Each subscriber (`--as <id>`, defaulting to the pattern) has its own
-read position *per pattern*. Reading one pattern therefore never consumes another
-pattern's messages, even under the same id. Cursors persist across daemon
-restarts, so an agent that dies and comes back resumes where it left off rather
-than replaying or missing.
+**Delivery.** The default is exclusive per pattern: each pattern has one read
+position shared by every consumer, and the first consumer to read a message
+takes it — it is never delivered again to anyone, even another consumer of the
+same pattern. A pool of reviewers sharing one pattern therefore splits the
+work, first-to-pick-up wins, with no coordination. Post with `--broadcast` to
+instead deliver a message to every consumer (distinct `--as` label) whose
+pattern matches, each getting their own copy once. `--as` labels are cosmetic
+for exclusive delivery but are the identity that scopes broadcast delivery.
 
 **Retention.** Messages live for 1 hour. The daemon exits after 1.5 hours idle —
 deliberately longer, so by the time it goes the logs hold nothing of value — and
@@ -58,12 +61,14 @@ restarts on the next command.
 | `read <pattern>` | Print all unread and exit immediately |
 | `follow <pattern>` | Stream continuously |
 | `history <pattern>` | Replay, ignoring cursors |
-| `status` | Partitions, message counts, subscriber lag |
+| `status` | Partitions, message counts, pattern positions, lag |
 | `stop` | Shut the daemon down |
 | `guide` | Full usage guide, written for AI agents |
 | `hook install <harness>` | Wire up Claude Code or OpenCode delivery |
 
-Add `--json` to any command for machine-readable output.
+Add `--json` to any command for machine-readable output. Add `--broadcast` to
+`post` to deliver a message to every consumer whose pattern matches, rather
+than exclusively to the first one that reads it.
 
 ## The two ways to receive
 
@@ -110,7 +115,7 @@ code contract. Point your agent's context at it.
 ## Development
 
 ```bash
-cargo test --workspace                      # 134 tests
+cargo test --workspace                      # 140 tests
 cargo clippy --workspace --all-targets      # pedantic, warning-free
 cargo fmt --all -- --check
 ```

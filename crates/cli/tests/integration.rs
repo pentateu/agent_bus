@@ -15,7 +15,11 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
@@ -174,8 +178,11 @@ fn reading_twice_does_not_redeliver() {
     stop(state);
 }
 
+/// Delivery is exclusive per pattern: two consumers reading with the same
+/// pattern share one position, so whichever reads first takes the message and
+/// the other sees nothing. `--as` labels do not create second positions.
 #[test]
-fn subscribers_have_independent_cursors() {
+fn consumers_sharing_a_pattern_are_exclusive() {
     let dir = TempDir::new().unwrap();
     let state = dir.path();
 
@@ -184,8 +191,8 @@ fn subscribers_have_independent_cursors() {
 
     let planner = bus(state, &["read", "iot_base/**", "--as", "planner"]);
     assert!(
-        stdout(&planner).contains("shared message"),
-        "one subscriber reading must not consume for another"
+        !stdout(&planner).contains("shared message"),
+        "the message was already delivered under the pattern; a second consumer must not get it"
     );
 
     stop(state);
@@ -345,6 +352,241 @@ fn concurrent_first_use_starts_exactly_one_daemon() {
     stop(&state);
 }
 
+/// The full concurrency contract: several posters and several readers all
+/// active at once on one partition. Delivery is exclusive per pattern, so all
+/// the readers on `conc/**` split the posted messages between them: every
+/// message goes to exactly one reader, never to two, and none are lost. The
+/// invariant asserted across the whole pool is therefore "each message
+/// delivered exactly once" — the union of what all readers saw is precisely the
+/// posted set, with no duplicates and no gaps.
+#[test]
+fn concurrent_posters_and_readers_deliver_each_message_exactly_once() {
+    const POSTERS: usize = 4;
+    const MESSAGES: usize = 5;
+    const READERS: usize = 4;
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().to_path_buf();
+
+    let expected_sorted: Vec<String> =
+        (0..POSTERS * MESSAGES).map(|i| format!("msg {i:02}")).collect();
+
+    let poster_handles: Vec<_> = (0..POSTERS)
+        .map(|p| {
+            let poster_state = state.clone();
+            std::thread::spawn(move || {
+                for m in 0..MESSAGES {
+                    let body = format!("msg {:02}", p * MESSAGES + m);
+                    let out = Command::new(binary("agent-bus"))
+                        .args(["post", "conc/dev_01", &body])
+                        .env("AGENT_BUS_STATE_DIR", &poster_state)
+                        .env("AGENT_BUS_DAEMON_BIN", binary("agent-bus-daemon"))
+                        .output()
+                        .expect("running post");
+                    assert_eq!(out.status.code(), Some(0), "post failed: {}", stderr(&out));
+                }
+            })
+        })
+        .collect();
+
+    // Readers keep draining until every post has landed AND the pattern comes
+    // back empty. A post landing right after an empty read would otherwise be
+    // missed, so the flag is what distinguishes "drained" from "not posted
+    // yet"; once it is set, an empty read is proof the pattern is empty for
+    // good, because no reader leaves a message undelivered once it is unread.
+    let posters_done = Arc::new(AtomicBool::new(false));
+
+    let reader_handles: Vec<_> = (0..READERS)
+        .map(|r| {
+            let reader_state = state.clone();
+            let posters_done = Arc::clone(&posters_done);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut seen: Vec<String> = Vec::new();
+                while Instant::now() < deadline {
+                    let out = Command::new(binary("agent-bus"))
+                        .args(["read", "conc/**", "--as", &format!("reader{r}"), "--json"])
+                        .env("AGENT_BUS_STATE_DIR", &reader_state)
+                        .env("AGENT_BUS_DAEMON_BIN", binary("agent-bus-daemon"))
+                        .output()
+                        .expect("running read");
+                    assert_eq!(out.status.code(), Some(0), "read failed: {}", stderr(&out));
+                    let batch = bodies(&out);
+                    let was_empty = batch.is_empty();
+                    seen.extend(batch);
+                    if was_empty && posters_done.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                seen
+            })
+        })
+        .collect();
+
+    for handle in poster_handles {
+        handle.join().unwrap();
+    }
+    posters_done.store(true, Ordering::Release);
+
+    let mut pooled: Vec<String> = Vec::new();
+    for handle in reader_handles {
+        pooled.extend(handle.join().unwrap());
+    }
+    pooled.sort();
+    assert_eq!(
+        pooled, expected_sorted,
+        "the readers' pooled deliveries must be exactly the posted set: no duplicates, no losses"
+    );
+
+    stop(&state);
+}
+
+/// Multiple waiters blocked at the same time, with posts arriving mid-block.
+/// Delivery is exclusive per pattern, so the waiters on `conc/**` split the
+/// messages between them: each message wakes exactly one waiter and is never
+/// handed to a second one. The pooled invariant is that every posted message is
+/// delivered exactly once across all waiters.
+#[test]
+fn concurrent_waiters_each_receive_every_message_exactly_once() {
+    const WAITERS: usize = 3;
+    const MESSAGES: usize = 6;
+
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().to_path_buf();
+
+    assert_ok(&bus(&state, &["daemon", "conc/**"]), "daemon");
+
+    let expected_sorted: Vec<String> = (0..MESSAGES).map(|m| format!("wait msg {m}")).collect();
+    let posters_done = Arc::new(AtomicBool::new(false));
+
+    let waiter_handles: Vec<_> = (0..WAITERS)
+        .map(|w| {
+            let waiter_state = state.clone();
+            let posters_done = Arc::clone(&posters_done);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                let mut seen: Vec<String> = Vec::new();
+                while Instant::now() < deadline {
+                    let out = Command::new(binary("agent-bus"))
+                        .args([
+                            "wait",
+                            "conc/**",
+                            "--as",
+                            &format!("waiter{w}"),
+                            "--timeout",
+                            "10s",
+                            "--json",
+                        ])
+                        .env("AGENT_BUS_STATE_DIR", &waiter_state)
+                        .env("AGENT_BUS_DAEMON_BIN", binary("agent-bus-daemon"))
+                        .output()
+                        .expect("running wait");
+                    match out.status.code() {
+                        Some(0) => {
+                            let batch = bodies(&out);
+                            assert_eq!(batch.len(), 1, "wait must return exactly one message");
+                            seen.extend(batch);
+                        }
+                        // A timeout is only the end once every post has landed;
+                        // before that it just means "nothing left for me right
+                        // now", and blocking again is the correct move.
+                        Some(2) if !posters_done.load(Ordering::Acquire) => {}
+                        Some(2) => break,
+                        code => panic!("wait exited {code:?}: {}", stderr(&out)),
+                    }
+                }
+                seen
+            })
+        })
+        .collect();
+
+    // Let the waiters block before the posts land, so the wake path is exercised.
+    std::thread::sleep(Duration::from_millis(500));
+
+    for m in 0..MESSAGES {
+        assert_ok(&bus(&state, &["post", "conc/dev_01", &format!("wait msg {m}")]), "post");
+    }
+    posters_done.store(true, Ordering::Release);
+
+    let mut pooled: Vec<String> = Vec::new();
+    for handle in waiter_handles {
+        pooled.extend(handle.join().unwrap());
+    }
+    pooled.sort();
+    assert_eq!(
+        pooled, expected_sorted,
+        "the waiters' pooled deliveries must be exactly the posted set: no duplicates, no losses"
+    );
+
+    stop(&state);
+}
+
+/// A broadcast message is delivered to every consumer with a distinct `--as`
+/// label whose pattern matches the topic, each getting their own copy exactly
+/// once. It is the one case where the same message legitimately reaches
+/// multiple consumers.
+#[test]
+fn broadcast_messages_are_delivered_to_every_distinct_label() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path();
+
+    bus(state, &["post", "iot_base/announce", "to everyone", "--broadcast"]);
+
+    let reviewer = bus(state, &["read", "iot_base/**", "--as", "reviewer", "--json"]);
+    let planner = bus(state, &["read", "iot_base/**", "--as", "planner", "--json"]);
+    let dev = bus(state, &["read", "iot_base/*", "--as", "dev", "--json"]);
+
+    assert_eq!(bodies(&reviewer), vec!["to everyone"]);
+    assert_eq!(bodies(&planner), vec!["to everyone"], "a distinct label gets its own copy");
+    assert_eq!(bodies(&dev), vec!["to everyone"], "a different matching pattern still gets it");
+
+    // Once per label: the second read under the same label sees nothing.
+    let again = bus(state, &["read", "iot_base/**", "--as", "reviewer", "--json"]);
+    assert!(bodies(&again).is_empty(), "a label must receive a broadcast message exactly once");
+
+    stop(state);
+}
+
+/// Two labels sharing one broadcast position is the same consumer: without
+/// distinct `--as` labels, a broadcast message is delivered once, not per
+/// invocation.
+#[test]
+fn broadcast_is_consumed_once_per_label_not_once_per_call() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path();
+
+    bus(state, &["post", "iot_base/announce", "shared", "--broadcast"]);
+    bus(state, &["read", "iot_base/**", "--as", "same"]);
+    let again = bus(state, &["read", "iot_base/**", "--as", "same", "--json"]);
+    assert!(bodies(&again).is_empty(), "the same label must not receive the message twice");
+
+    stop(state);
+}
+
+/// Broadcast and exclusive delivery coexist in one partition: an exclusive
+/// message is delivered once per pattern, a broadcast message once per label.
+#[test]
+fn exclusive_and_broadcast_messages_coexist() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path();
+
+    bus(state, &["post", "iot_base/announce", "bcast", "--broadcast"]);
+    bus(state, &["post", "iot_base/dev_01", "excl"]);
+
+    // First consumer takes the exclusive message and its own copy of the
+    // broadcast message.
+    let reviewer = bus(state, &["read", "iot_base/**", "--as", "reviewer", "--json"]);
+    let mut got = bodies(&reviewer);
+    got.sort();
+    assert_eq!(got, vec!["bcast", "excl"]);
+
+    // Second consumer sees the broadcast copy but not the exclusive message,
+    // which the first consumer already claimed.
+    let planner = bus(state, &["read", "iot_base/**", "--as", "planner", "--json"]);
+    assert_eq!(bodies(&planner), vec!["bcast"]);
+
+    stop(state);
+}
+
 #[test]
 fn invalid_input_exits_one() {
     let dir = TempDir::new().unwrap();
@@ -464,15 +706,15 @@ fn status_reports_partitions_and_lag() {
         .expect("the iot_base partition must be reported");
     assert_eq!(partition["message_count"].as_u64().unwrap(), 2);
 
-    // Looked up by id rather than by position: subscriber ordering is not part
-    // of the contract, so indexing [0] would be asserting on an accident.
-    let subscriber = partition["subscribers"]
+    // Looked up by key rather than by position: ordering is not part of
+    // the contract, so indexing [0] would be asserting on an accident.
+    let pattern = partition["patterns"]
         .as_array()
-        .expect("subscribers must be an array")
+        .expect("patterns must be an array")
         .iter()
-        .find(|s| s["id"] == "reviewer")
-        .expect("the reviewer subscriber must be reported");
-    assert_eq!(subscriber["lag"].as_u64().unwrap(), 1, "one message posted after the last read");
+        .find(|s| s["key"] == "iot_base/**" && s["broadcast"] == false)
+        .expect("the pattern position must be reported");
+    assert_eq!(pattern["lag"].as_u64().unwrap(), 1, "one message posted after the last delivery");
 
     stop(state);
 }
@@ -575,8 +817,8 @@ fn follow_streams_stored_and_later_messages() {
     stop(&state);
 }
 
-/// The subscriber id defaults to the pattern string, so two reads with the same
-/// pattern and no `--as` share one cursor, while a different pattern does not.
+/// The label defaults to the pattern string, so two reads with the same pattern
+/// and no `--as` share one position, while a different pattern does not.
 #[test]
 fn the_subscriber_id_defaults_to_the_pattern() {
     let dir = TempDir::new().unwrap();
@@ -587,29 +829,29 @@ fn the_subscriber_id_defaults_to_the_pattern() {
     let first = bus(state, &["read", "iot_base/**", "--json"]);
     assert_eq!(bodies(&first), vec!["default id message"]);
 
-    // Same pattern, no --as: the same implicit cursor, so nothing is left.
+    // Same pattern, no --as: the same position, so nothing is left.
     let again = bus(state, &["read", "iot_base/**", "--json"]);
-    assert!(bodies(&again).is_empty(), "the pattern-derived cursor must persist across runs");
+    assert!(bodies(&again).is_empty(), "the pattern position must persist across runs");
 
-    // A different pattern is a different subscriber and still has it unread.
+    // A different pattern is a different position and still has it unread.
     let other = bus(state, &["read", "iot_base/*", "--json"]);
     assert_eq!(
         bodies(&other),
         vec!["default id message"],
-        "a different pattern defaults to a different subscriber id"
+        "a different pattern has an independent position"
     );
 
-    // And the default id is literally the pattern string.
+    // And the default label is literally the pattern string.
     let status = bus(state, &["status", "--json"]);
     let parsed: serde_json::Value = serde_json::from_str(&stdout(&status)).unwrap();
-    let ids: Vec<&str> = parsed["partitions"][0]["subscribers"]
+    let ids: Vec<&str> = parsed["partitions"][0]["patterns"]
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|s| s["id"].as_str())
+        .filter_map(|s| s["label"].as_str())
         .collect();
-    assert!(ids.contains(&"iot_base/**"), "the default id is the pattern itself: {ids:?}");
-    assert!(ids.contains(&"iot_base/*"), "the default id is the pattern itself: {ids:?}");
+    assert!(ids.contains(&"iot_base/**"), "the default label is the pattern itself: {ids:?}");
+    assert!(ids.contains(&"iot_base/*"), "the default label is the pattern itself: {ids:?}");
 
     stop(state);
 }
@@ -876,18 +1118,21 @@ fn per_pattern_cursors_survive_a_restart() {
     stop(state);
 }
 
-/// Regression, CRITICAL 2: an `Ack` naming a traversal partition must be
-/// rejected and must create nothing outside the state directory.
+/// Regression, CRITICAL 2: a `post` naming a traversal topic must be rejected
+/// and must create nothing outside the state directory.
 ///
 /// The partition string is interpolated into a file name, so an unvalidated
-/// one wrote `<traversal>.jsonl` and `<traversal>.cursors.json` anywhere the
-/// daemon's uid could reach — arbitrary file creation, and truncation via the
-/// temp-file-and-rename in `persist_cursors`.
+/// one would write `<traversal>.jsonl` and `<traversal>.cursors.json` anywhere
+/// the daemon's uid could reach — arbitrary file creation, and truncation via
+/// the temp-file-and-rename in `persist_cursors`. A topic like `..`/`../` passes
+/// `Topic::parse` (segments need only be non-empty and wildcard-free), so the
+/// guard that matters is `PartitionName::parse`, applied before the partition
+/// becomes a path.
 ///
 /// Driven over a raw socket because the CLI never builds such a request; the
 /// threat is a hostile or buggy client, not this binary.
 #[test]
-fn an_ack_with_a_traversal_partition_is_rejected() {
+fn a_traversal_topic_is_rejected() {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
 
@@ -902,22 +1147,21 @@ fn an_ack_with_a_traversal_partition_is_rejected() {
 
     let traversal = format!("../../../..{}", escape.display());
     let request = serde_json::json!({
-        "type": "ack",
-        "partition": traversal,
-        "pattern": "iot_base/**",
-        "subscriber": "s",
-        "id": "01J000000000000000000000",
+        "type": "post",
+        "topic": traversal,
+        "body": "escape attempt",
+        "priority": "normal",
     });
 
     let mut sock = UnixStream::connect(state.join("agent-bus.sock")).expect("connecting");
-    writeln!(sock, "{request}").expect("writing the ack");
+    writeln!(sock, "{request}").expect("writing the post");
     sock.flush().unwrap();
 
     let mut response = String::new();
     BufReader::new(&sock).read_line(&mut response).expect("reading the response");
     let parsed: serde_json::Value =
         serde_json::from_str(&response).expect("the daemon must answer, not drop the connection");
-    assert_eq!(parsed["type"], "error", "a traversal partition must be rejected: {response}");
+    assert_eq!(parsed["type"], "error", "a traversal topic must be rejected: {response}");
 
     // The actual security property: nothing was created outside the state dir.
     assert!(

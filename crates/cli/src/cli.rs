@@ -67,6 +67,11 @@ pub enum Command {
         /// Sender name. Defaults to the topic's last segment.
         #[arg(long)]
         from: Option<String>,
+        /// Deliver this message to every consumer (distinct `--as` label)
+        /// whose pattern matches the topic, each getting their own copy once.
+        /// Without this, delivery is exclusive per pattern.
+        #[arg(long)]
+        broadcast: bool,
     },
 
     /// Block until one unread message arrives, print it, and exit.
@@ -76,7 +81,9 @@ pub enum Command {
     Wait {
         /// Topic pattern to watch, e.g. `iot_base/**`.
         pattern: String,
-        /// Subscriber identity for cursor tracking. Defaults to the pattern.
+        /// Label for status output. Delivery is exclusive per pattern, so this
+        /// does not create a second position; two consumers of one pattern
+        /// share it and the first to read wins.
         #[arg(long = "as")]
         as_id: Option<String>,
         /// Maximum time to block, e.g. `30m`. Defaults to 30m.
@@ -89,7 +96,9 @@ pub enum Command {
     Read {
         /// Topic pattern to drain, e.g. `iot_base/**`.
         pattern: String,
-        /// Subscriber identity for cursor tracking. Defaults to the pattern.
+        /// Label for status output. Delivery is exclusive per pattern, so this
+        /// does not create a second position; two consumers of one pattern
+        /// share it and the first to read wins.
         #[arg(long = "as")]
         as_id: Option<String>,
     },
@@ -99,7 +108,9 @@ pub enum Command {
     Follow {
         /// Topic pattern to stream, e.g. `iot_base/**`.
         pattern: String,
-        /// Subscriber identity for cursor tracking. Defaults to the pattern.
+        /// Label for status output. Delivery is exclusive per pattern, so this
+        /// does not create a second position; two consumers of one pattern
+        /// share it and the first to read wins.
         #[arg(long = "as")]
         as_id: Option<String>,
     },
@@ -148,10 +159,11 @@ pub enum HookAction {
     },
 }
 
-/// The subscriber id to use: explicit `--as`, else the pattern itself.
+/// The label to send as `--as`: explicit value, else the pattern itself.
 ///
-/// Defaulting to the pattern means a single agent per pattern needs no flag,
-/// while two agents sharing a pattern can be told apart with `--as`.
+/// Defaulting to the pattern means a consumer that never passes `--as` is still
+/// identifiable in `status`. The label plays no part in delivery — exclusivity
+/// is keyed on the pattern — so this is cosmetic, not positional.
 #[must_use]
 pub fn subscriber_id(as_id: Option<&str>, pattern: &str) -> String {
     as_id.unwrap_or(pattern).to_owned()

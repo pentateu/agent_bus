@@ -1,16 +1,15 @@
 //! `agent-bus wait` — block for one unread message.
 
-use agent_bus_core::Pattern;
 use agent_bus_protocol::{Request, Response};
 use anyhow::Result;
 
-use crate::{
-    cli::ExitCode,
-    client::Client,
-    commands::{print_and_ack, unexpected},
-};
+use crate::{cli::ExitCode, client::Client, commands::unexpected, output};
 
 /// Block for one unread message.
+///
+/// Delivery is exclusive: the daemon marks the returned message delivered for
+/// the whole pattern before answering, so no other consumer receives it and a
+/// later `wait`/`read` under the same pattern will not return it again.
 ///
 /// Exits 2 on timeout so `while agent-bus wait ...; do ...; done` terminates
 /// cleanly rather than looping on an error.
@@ -19,24 +18,17 @@ use crate::{
 /// Returns an error if the pattern is invalid or the daemon fails the request.
 pub fn run(
     pattern: &str,
-    subscriber: String,
+    label: String,
     timeout_secs: Option<u64>,
     json: bool,
 ) -> Result<ExitCode> {
-    // Parsed client-side purely to learn the partition and pattern for the ack.
-    // The daemon parses it again authoritatively.
-    let parsed = Pattern::parse(pattern)?;
-
     let mut client = Client::connect()?;
-    let response = client.request(&Request::Wait {
-        pattern: pattern.to_owned(),
-        subscriber: subscriber.clone(),
-        timeout_secs,
-    })?;
+    let response =
+        client.request(&Request::Wait { pattern: pattern.to_owned(), label, timeout_secs })?;
 
     match response {
         Response::Messages { messages } => {
-            print_and_ack(&mut client, &messages, &parsed, subscriber, json)?;
+            output::print_messages(&messages, json)?;
             Ok(ExitCode::Success)
         }
         Response::Timeout => {

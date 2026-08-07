@@ -1,8 +1,16 @@
-//! One partition: its durable log, its cursors, and its waiter wake-ups.
+//! One partition: its durable log, its per-pattern delivery positions, and its
+//! waiter wake-ups.
 //!
 //! A partition is the hard isolation boundary between unrelated projects
 //! sharing one daemon. Nothing here can read another partition's state,
 //! because a `Partition` only ever holds paths derived from its own name.
+//!
+//! Delivery is exclusive per pattern: [`Partition::deliver`] computes the
+//! unread messages matching a pattern and advances that pattern's position in
+//! the same step, under the caller's lock. Because every delivery runs inside
+//! the daemon's single state lock, no other client can interleave — so exactly
+//! one consumer ever receives each message. There is no separate
+//! acknowledge-and-later-advance step to race.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -23,36 +31,47 @@ use crate::log::PartitionLog;
 /// lagged receiver is harmless — it just means "check again".
 const NOTIFY_CAPACITY: usize = 64;
 
-/// One subscriber's line in `status`.
+/// One position's line in `status`.
 ///
-/// A named struct rather than a tuple: `(String, String, usize, bool)` has two
-/// same-typed leading fields that are trivial to transpose at the call site.
-pub struct SubscriberSnapshot {
-    pub id: String,
-    /// The pattern this cursor tracks. Cursors are per (subscriber, pattern),
-    /// so the id alone does not identify a position.
-    pub pattern: String,
+/// A position is either an exclusive per-pattern position or a broadcast
+/// per-label position; `broadcast` says which, so the two never collide even
+/// though both report a `key` and a `label`.
+pub struct PatternSnapshot {
+    /// The position key: a pattern string for exclusive delivery, a consumer
+    /// label for broadcast delivery.
+    pub key: String,
+    /// The `--as` label most recently used with this pattern, if any. For a
+    /// broadcast position this is the same as `key` — the label IS the
+    /// position's identity.
+    pub label: String,
+    /// True when this is a broadcast (per-label) position rather than an
+    /// exclusive (per-pattern) position.
+    pub broadcast: bool,
     pub cursor: String,
     /// Messages behind this cursor that match its pattern.
     pub lag: usize,
-    /// True if pruning dragged this cursor forward, meaning the subscriber
-    /// provably missed messages.
+    /// True if pruning dragged this cursor forward, meaning messages were lost.
     pub snapped: bool,
 }
 
-/// One isolated project namespace: its log, its cursors, its waiters.
+/// One isolated project namespace: its log, its per-pattern positions, its
+/// waiters.
 pub struct Partition {
     name: PartitionName,
     log: PartitionLog,
     cursors: CursorStore,
     cursor_file: PathBuf,
-    /// (subscriber, pattern) pairs whose cursors were dragged forward by
-    /// pruning, meaning they provably missed messages. Reported by `status`.
+    /// Pattern strings whose cursors were dragged forward by pruning, meaning
+    /// messages were provably lost.
     ///
     /// Deliberately in-memory only: it describes what this daemon process
     /// observed, and a restart genuinely cannot know whether an old cursor was
     /// snapped or simply acknowledged.
-    snapped: Vec<(String, String)>,
+    snapped: Vec<String>,
+    /// The most recent `--as` label seen per pattern. In-memory only: a label
+    /// is cosmetic, and persisting it would let a stale name outlive the
+    /// process that chose it.
+    labels: std::collections::BTreeMap<String, String>,
     notify: broadcast::Sender<()>,
 }
 
@@ -81,14 +100,14 @@ impl Partition {
                 if let Some(reason) = reason {
                     eprintln!(
                         "agent-bus: ignoring unreadable cursor file {} ({reason}); \
-                         subscribers in {name} restart from the beginning of the retained log",
+                         unread messages in {name} will be delivered again",
                         cursor_file.display()
                     );
                 }
                 store
             }
             // A missing cursor file is the normal first-run state, not an
-            // error: every subscriber simply starts at "nothing consumed".
+            // error: every pattern simply starts at "nothing consumed".
             // Checked by kind rather than by a prior `exists()` call so a file
             // deleted between the two cannot turn into a spurious failure.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => CursorStore::default(),
@@ -98,7 +117,15 @@ impl Partition {
         };
         let (notify, _) = broadcast::channel(NOTIFY_CAPACITY);
 
-        Ok(Self { name: name.clone(), log, cursors, cursor_file, snapped: Vec::new(), notify })
+        Ok(Self {
+            name: name.clone(),
+            log,
+            cursors,
+            cursor_file,
+            snapped: Vec::new(),
+            labels: std::collections::BTreeMap::new(),
+            notify,
+        })
     }
 
     #[must_use]
@@ -117,11 +144,6 @@ impl Partition {
     /// # Errors
     /// Returns an error if the append fails. The message is not considered
     /// published unless it reached disk.
-    // Takes the message by value even though the body only borrows it: handing
-    // a message to the bus is a transfer of ownership, and callers build one
-    // solely to publish it. `PartitionLog::append` cloning internally is an
-    // implementation detail that a `&Message` signature would leak into every
-    // call site.
     #[allow(clippy::needless_pass_by_value)]
     pub fn publish(&mut self, message: Message) -> Result<Ulid> {
         let id = message.id;
@@ -133,40 +155,98 @@ impl Partition {
         Ok(id)
     }
 
-    /// Messages matching `pattern` that `subscriber` has not consumed *for that
-    /// pattern*.
+    /// Deliver up to `limit` messages matching `pattern` and advance positions.
     ///
-    /// The cursor is keyed on the pattern as well as the subscriber, so seeking
-    /// past a message this pattern never selected is impossible: a position
-    /// only ever reflects messages that were actually delivered under this
-    /// pattern.
+    /// Two kinds of messages are delivered, and each has its own position:
     ///
-    /// Borrows rather than clones: most callers only count or inspect the
-    /// result, and the handler clones just the messages it actually sends.
-    #[must_use]
-    pub fn unread(&self, pattern: &Pattern, subscriber: &str) -> Vec<&Message> {
-        let cursor = self.cursors.position(subscriber, pattern.as_str());
-        self.log.messages_after(cursor).filter(|m| pattern.matches(&m.topic)).collect()
+    /// * **Exclusive** messages (`broadcast == false`) are first-consumer-wins
+    ///   per pattern. The advance happens here, in the same locked call as the
+    ///   scan, so two consumers racing on one pattern cannot both receive the
+    ///   same message: whichever takes the lock first delivers and advances;
+    ///   the other then sees nothing unread. A later `read`/`wait`/`follow`
+    ///   under that pattern will not return it again.
+    ///
+    /// * **Broadcast** messages (`broadcast == true`) are delivered once per
+    ///   consumer label. Each label's broadcast position advances past what
+    ///   this consumer has seen, so every distinct `--as` label gets its own
+    ///   copy — and only one copy, no matter how many patterns it reads that
+    ///   happen to match.
+    ///
+    /// `limit` lets `wait` deliver at most one unit of work while `read` and
+    /// `follow` drain everything currently unread. `history` is the only way to
+    /// see a delivered message again.
+    ///
+    /// # Errors
+    /// Returns an error if a cursor position cannot be persisted.
+    pub fn deliver(
+        &mut self,
+        pattern: &Pattern,
+        label: &str,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let exclusive_cursor = self.cursors.exclusive_position(pattern.as_str());
+        let broadcast_cursor = self.cursors.broadcast_position(label);
+
+        // Merge the two streams in id order and take `limit`. Each stream is
+        // already sorted, so this is a merge of two sorted lists rather than a
+        // full sort.
+        let exclusive: Vec<Message> = self
+            .log
+            .messages_after(exclusive_cursor)
+            .filter(|m| !m.broadcast && pattern.matches(&m.topic))
+            .take(limit)
+            .cloned()
+            .collect();
+        let broadcast: Vec<Message> = self
+            .log
+            .messages_after(broadcast_cursor)
+            .filter(|m| m.broadcast && pattern.matches(&m.topic))
+            .take(limit)
+            .cloned()
+            .collect();
+
+        let mut merged = Vec::with_capacity(exclusive.len() + broadcast.len());
+        let mut e = exclusive.into_iter();
+        let mut b = broadcast.into_iter();
+        let mut e_next = e.next();
+        let mut b_next = b.next();
+        while let (Some(e_msg), Some(b_msg)) = (e_next.as_ref(), b_next.as_ref()) {
+            if e_msg.id < b_msg.id {
+                if let Some(taken) = e_next.take() {
+                    merged.push(taken);
+                }
+                e_next = e.next();
+            } else {
+                if let Some(taken) = b_next.take() {
+                    merged.push(taken);
+                }
+                b_next = b.next();
+            }
+        }
+        // One stream is exhausted. Drain the survivor: the item already pulled
+        // (`e_next`/`b_next`) plus everything still in the iterator.
+        merged.extend(e_next.into_iter().chain(e));
+        merged.extend(b_next.into_iter().chain(b));
+        merged.truncate(limit);
+
+        // Advance each position to the last delivered message of its kind.
+        if let Some(last) = merged.iter().rev().find(|m| !m.broadcast) {
+            self.cursors.advance_exclusive(pattern.as_str(), last.id);
+        }
+        if let Some(last) = merged.iter().rev().find(|m| m.broadcast) {
+            self.cursors.advance_broadcast(label, last.id);
+        }
+        if !merged.is_empty() {
+            self.persist_cursors()?;
+        }
+        self.labels.insert(pattern.as_str().to_owned(), label.to_owned());
+        Ok(merged)
     }
 
     /// Replay a time window, ignoring cursors entirely.
     #[must_use]
     pub fn history(&self, pattern: &Pattern, since_secs: Option<u64>, now: u64) -> Vec<&Message> {
         self.log.messages_since(since_secs, now).filter(|m| pattern.matches(&m.topic)).collect()
-    }
-
-    /// Record that `subscriber` consumed up to `id` while reading `pattern`,
-    /// and persist it.
-    ///
-    /// The pattern is required because it is half the cursor key: an ack must
-    /// advance only the position for the pattern that produced the delivery,
-    /// never a sibling pattern's.
-    ///
-    /// # Errors
-    /// Returns an error if the cursor file cannot be written.
-    pub fn acknowledge(&mut self, subscriber: &str, pattern: &str, id: Ulid) -> Result<()> {
-        self.cursors.advance(subscriber, pattern, id);
-        self.persist_cursors()
     }
 
     /// Apply retention and drag stale cursors forward.
@@ -180,21 +260,18 @@ impl Partition {
             && let Some(oldest) = outcome.oldest_surviving
         {
             // `snap_forward` snaps a stale cursor *to* `oldest_surviving`,
-            // which marks that message as already consumed, so a snapped
-            // subscriber is not delivered it. That is the right call: the
-            // cursor pointed into history that has now been deleted, so the
-            // subscriber has demonstrably missed messages either way and the
-            // delivery gap is real, not something one extra message repairs.
-            // Snapping to just *before* the boundary would instead hand over
-            // one arbitrary survivor while silently dropping the rest, which
-            // reads as complete delivery when it is not. Losing it and
+            // which marks that message as already delivered, so the pattern or
+            // label is not handed it again. That is the right call: the cursor
+            // pointed into history that has now been deleted, so messages have
+            // demonstrably been lost either way and the delivery gap is real,
+            // not something one extra message repairs. Losing them and
             // reporting `snapped: true` in `status` makes the gap visible
             // rather than papering over it with a partial replay.
             let snapped = self.cursors.snap_forward(oldest);
             if !snapped.is_empty() {
-                for pair in snapped {
-                    if !self.snapped.contains(&pair) {
-                        self.snapped.push(pair);
+                for key in snapped {
+                    if !self.snapped.contains(&key) {
+                        self.snapped.push(key);
                     }
                 }
                 self.persist_cursors()?;
@@ -218,49 +295,58 @@ impl Partition {
         self.log.messages().first().map(|m| m.age_secs(now))
     }
 
-    /// Per-(subscriber, pattern) detail for `status`.
+    /// Per-position detail for `status`.
     ///
-    /// One line per cursor, so a subscriber reading two patterns appears twice.
-    /// That matches the data model: it has two independent positions and two
-    /// independent lags, and collapsing them would have to invent a single
-    /// number that describes neither.
-    ///
-    /// Lag counts only messages the cursor's own pattern selects. Counting
-    /// everything after the cursor would report a subscriber as behind on
-    /// messages its pattern will never deliver.
+    /// One line per exclusive pattern position, then one per broadcast label
+    /// position. Lag counts only messages the position's own kind and pattern
+    /// select: exclusive lag counts non-broadcast messages a pattern has not
+    /// delivered, broadcast lag counts broadcast messages a label has not seen.
     #[must_use]
-    pub fn subscriber_snapshots(&self) -> Vec<SubscriberSnapshot> {
-        self.cursors
-            .subscribers()
-            .map(|(id, pattern, cursor)| {
-                // A stored pattern that no longer parses cannot select
-                // anything, so it contributes no lag rather than failing the
-                // whole status call.
-                let lag = Pattern::parse(pattern).map_or(0, |parsed| {
-                    self.log
-                        .messages_after(Some(cursor))
-                        .filter(|m| parsed.matches(&m.topic))
-                        .count()
-                });
-                SubscriberSnapshot {
-                    lag,
-                    snapped: self.snapped.iter().any(|(s, p)| s == id && p == pattern),
-                    id: id.to_owned(),
-                    pattern: pattern.to_owned(),
-                    cursor: cursor.to_string(),
-                }
-            })
-            .collect()
+    pub fn pattern_snapshots(&self) -> Vec<PatternSnapshot> {
+        let mut snapshots = Vec::new();
+
+        for (pattern, cursor) in self.cursors.exclusive_cursors() {
+            // A stored pattern that no longer parses cannot select anything, so
+            // it contributes no lag rather than failing the whole status call.
+            let lag = Pattern::parse(pattern).map_or(0, |parsed| {
+                self.log
+                    .messages_after(Some(cursor))
+                    .filter(|m| !m.broadcast && parsed.matches(&m.topic))
+                    .count()
+            });
+            let label = self.labels.get(pattern).cloned().unwrap_or_default();
+            snapshots.push(PatternSnapshot {
+                lag,
+                snapped: self.snapped.iter().any(|s| s == &format!("exclusive:{pattern}")),
+                label,
+                key: pattern.to_owned(),
+                broadcast: false,
+                cursor: cursor.to_string(),
+            });
+        }
+
+        for (label, cursor) in self.cursors.broadcast_cursors() {
+            let lag = self.log.messages_after(Some(cursor)).filter(|m| m.broadcast).count();
+            snapshots.push(PatternSnapshot {
+                lag,
+                snapped: self.snapped.iter().any(|s| s == &format!("broadcast:{label}")),
+                label: label.to_owned(),
+                key: label.to_owned(),
+                broadcast: true,
+                cursor: cursor.to_string(),
+            });
+        }
+
+        snapshots
     }
 
     /// Write the cursor file via a temp file and a rename, so a reader never
     /// sees a half-written file.
     ///
     /// Deliberately not fsynced, unlike the log. The asymmetry is intentional:
-    /// a cursor lost to a power failure rewinds a subscriber and redelivers
-    /// messages it already saw, which the design already tolerates (`wait` is
-    /// at-least-once and clients ack explicitly). A *message* lost the same way
-    /// is unrecoverable, so only the log pays for an fsync on every write.
+    /// a cursor lost to a power failure redelivers messages the pattern already
+    /// saw, which exclusive delivery absorbs cleanly. A *message* lost the same
+    /// way is unrecoverable, so only the log pays for an fsync on every write.
     fn persist_cursors(&self) -> Result<()> {
         let json = self.cursors.to_json().context("serializing cursors")?;
         let temp = self.temp_cursor_path();
@@ -286,7 +372,7 @@ impl Partition {
 
 #[cfg(test)]
 mod tests {
-    use agent_bus_core::{Message, Pattern, Priority, Topic};
+    use agent_bus_core::{Message, Priority, Topic};
     use tempfile::TempDir;
 
     use super::*;
@@ -307,90 +393,33 @@ mod tests {
         p.publish(msg("iot_base/planner", "from planner")).unwrap();
 
         let pattern = Pattern::parse("iot_base/dev_01").unwrap();
-        let unread: Vec<&str> =
-            p.unread(&pattern, "reviewer").iter().map(|m| m.body.as_str()).collect();
-        assert_eq!(unread, vec!["from dev"]);
+        let delivered: Vec<String> =
+            p.deliver(&pattern, "dev", usize::MAX).unwrap().into_iter().map(|m| m.body).collect();
+        assert_eq!(delivered, vec!["from dev".to_owned()]);
     }
 
     #[test]
-    fn unread_is_empty_once_acknowledged() {
+    fn delivered_messages_are_not_returned_again() {
         let dir = TempDir::new().unwrap();
         let mut p = partition(&dir);
-        let m = msg("iot_base/dev_01", "one");
-        p.publish(m.clone()).unwrap();
+        p.publish(msg("iot_base/dev_01", "one")).unwrap();
 
         let pattern = Pattern::parse("iot_base/**").unwrap();
-        assert_eq!(p.unread(&pattern, "reviewer").len(), 1);
-        p.acknowledge("reviewer", pattern.as_str(), m.id).unwrap();
-        assert!(p.unread(&pattern, "reviewer").is_empty());
+        assert_eq!(p.deliver(&pattern, "r", usize::MAX).unwrap().len(), 1);
+        assert!(
+            p.deliver(&pattern, "r", usize::MAX).unwrap().is_empty(),
+            "delivery must be exclusive: once handed out, never returned"
+        );
     }
 
+    /// Delivery exclusivity is per pattern: reading one pattern advances only
+    /// that pattern's position, leaving another pattern's position untouched.
     #[test]
-    fn a_new_subscriber_sees_the_full_retained_log() {
-        // This is the race the durable log exists to solve: the dev agent posts
-        // before the reviewer ever connects, and the reviewer must still get it.
-        let dir = TempDir::new().unwrap();
-        let mut p = partition(&dir);
-        p.publish(msg("iot_base/dev_01", "ready for review")).unwrap();
-
-        let pattern = Pattern::parse("iot_base/**").unwrap();
-        let unread = p.unread(&pattern, "reviewer_that_started_late");
-        assert_eq!(unread.len(), 1);
-        assert_eq!(unread[0].body, "ready for review");
-    }
-
-    #[test]
-    fn cursors_are_per_subscriber() {
-        let dir = TempDir::new().unwrap();
-        let mut p = partition(&dir);
-        let m = msg("iot_base/dev_01", "one");
-        p.publish(m.clone()).unwrap();
-        p.acknowledge("reviewer", "iot_base/**", m.id).unwrap();
-
-        let pattern = Pattern::parse("iot_base/**").unwrap();
-        assert!(p.unread(&pattern, "reviewer").is_empty());
-        assert_eq!(p.unread(&pattern, "planner").len(), 1, "planner has its own cursor");
-    }
-
-    #[test]
-    fn cursors_survive_reopen() {
-        let dir = TempDir::new().unwrap();
-        let m = msg("iot_base/dev_01", "one");
-        {
-            let mut p = partition(&dir);
-            p.publish(m.clone()).unwrap();
-            p.acknowledge("reviewer", "iot_base/**", m.id).unwrap();
-        }
-        let p = partition(&dir);
-        let pattern = Pattern::parse("iot_base/**").unwrap();
-        assert!(p.unread(&pattern, "reviewer").is_empty(), "cursor must persist across restart");
-    }
-
-    #[test]
-    fn history_ignores_cursors() {
-        let dir = TempDir::new().unwrap();
-        let mut p = partition(&dir);
-        let m = msg("iot_base/dev_01", "one");
-        p.publish(m.clone()).unwrap();
-        p.acknowledge("reviewer", "iot_base/**", m.id).unwrap();
-
-        let pattern = Pattern::parse("iot_base/**").unwrap();
-        let now = m.id.timestamp_ms() / 1000;
-        assert_eq!(p.history(&pattern, None, now).len(), 1, "history replays consumed messages");
-    }
-
-    /// Regression: acking a message delivered under one pattern must not
-    /// consume the messages a *different* pattern would have delivered to the
-    /// same subscriber.
-    ///
-    /// Previously one cursor per subscriber meant the ack for `dev_01` seeked
-    /// past the older `planner` message, which was then unreachable forever.
-    #[test]
-    fn acking_one_pattern_does_not_consume_another_patterns_messages() {
+    fn delivering_one_pattern_does_not_consume_another_patterns_messages() {
         let dir = TempDir::new().unwrap();
         let mut p = partition(&dir);
 
-        // `planner` is published first, so a subscriber-wide cursor set to the
+        // `planner` is published first, so a partition-wide position set to the
         // `dev_01` id would seek straight past it.
         p.publish(msg("iot_base/planner", "P1")).unwrap();
         let dev = msg("iot_base/dev_01", "D1");
@@ -399,39 +428,67 @@ mod tests {
         let dev_pattern = Pattern::parse("iot_base/dev_01").unwrap();
         let planner_pattern = Pattern::parse("iot_base/planner").unwrap();
 
-        // The subscriber waits on dev_01 and acks what it was given.
-        assert_eq!(p.unread(&dev_pattern, "w1").len(), 1);
-        p.acknowledge("w1", dev_pattern.as_str(), dev.id).unwrap();
+        p.deliver(&dev_pattern, "w1", usize::MAX).unwrap();
 
-        let planner: Vec<&str> =
-            p.unread(&planner_pattern, "w1").iter().map(|m| m.body.as_str()).collect();
-        assert_eq!(planner, vec!["P1"], "the planner message must survive an ack on dev_01");
+        let planner: Vec<String> = p
+            .deliver(&planner_pattern, "w1", usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.body)
+            .collect();
+        assert_eq!(
+            planner,
+            vec!["P1".to_owned()],
+            "the planner message must survive a delivery on dev_01"
+        );
     }
 
-    /// The same guarantee across a reopen: the per-pattern positions are what
-    /// gets persisted, not a single collapsed one.
+    /// Two consumers of the same pattern share one position, so the first to
+    /// deliver takes the message and the second sees nothing.
     #[test]
-    fn per_pattern_cursors_survive_reopen() {
+    fn concurrent_consumers_of_one_pattern_are_exclusive() {
         let dir = TempDir::new().unwrap();
-        let planner = msg("iot_base/planner", "P1");
-        let dev = msg("iot_base/dev_01", "D1");
-        {
-            let mut p = partition(&dir);
-            p.publish(planner.clone()).unwrap();
-            p.publish(dev.clone()).unwrap();
-            p.acknowledge("w1", "iot_base/dev_01", dev.id).unwrap();
+        let mut p = partition(&dir);
+        p.publish(msg("iot_base/dev_01", "one")).unwrap();
+
+        let pattern = Pattern::parse("iot_base/**").unwrap();
+        assert_eq!(p.deliver(&pattern, "reviewer_01", usize::MAX).unwrap().len(), 1);
+        assert_eq!(
+            p.deliver(&pattern, "reviewer_02", usize::MAX).unwrap().len(),
+            0,
+            "a second consumer under the same pattern must not receive the message"
+        );
+    }
+
+    #[test]
+    fn wait_delivers_at_most_one_message() {
+        let dir = TempDir::new().unwrap();
+        let mut p = partition(&dir);
+        for body in ["one", "two", "three"] {
+            p.publish(msg("iot_base/dev_01", body)).unwrap();
         }
 
-        let p = partition(&dir);
-        assert!(
-            p.unread(&Pattern::parse("iot_base/dev_01").unwrap(), "w1").is_empty(),
-            "the acked pattern stays acked"
-        );
-        assert_eq!(
-            p.unread(&Pattern::parse("iot_base/planner").unwrap(), "w1").len(),
-            1,
-            "the unacked pattern still has its message after a restart"
-        );
+        let pattern = Pattern::parse("iot_base/**").unwrap();
+        let first = p.deliver(&pattern, "w", 1).unwrap();
+        assert_eq!(first.len(), 1, "wait delivers exactly one, oldest first");
+        assert_eq!(first[0].body, "one");
+
+        let rest = p.deliver(&pattern, "w", 1).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].body, "two");
+    }
+
+    #[test]
+    fn history_ignores_cursors() {
+        let dir = TempDir::new().unwrap();
+        let mut p = partition(&dir);
+        let m = msg("iot_base/dev_01", "one");
+        p.publish(m.clone()).unwrap();
+        p.deliver(&Pattern::parse("iot_base/**").unwrap(), "r", usize::MAX).unwrap();
+
+        let pattern = Pattern::parse("iot_base/**").unwrap();
+        let now = m.id.timestamp_ms() / 1000;
+        assert_eq!(p.history(&pattern, None, now).len(), 1, "history replays delivered messages");
     }
 
     /// An unreadable cursor file must not take the partition down with it: the
@@ -445,18 +502,18 @@ mod tests {
             let mut p = partition(&dir);
             p.publish(msg("iot_base/dev_01", "one")).unwrap();
         }
-        // The pre-rekeying flat format, which no longer parses.
+        // The pre-exclusive-delivery nested format, which no longer parses.
         std::fs::write(
             cursor_path(dir.path(), &name),
-            r#"{"reviewer":"01J000000000000000000000"}"#,
+            r#"{"reviewer":{"iot_base/**":"01J000000000000000000000"}}"#,
         )
         .unwrap();
 
         // Unwrapped rather than `expect`ed: an `Err` here *is* the regression
         // (a bad cursor file failing the open), and the panic reports it.
-        let p = Partition::open(dir.path(), &name).unwrap();
+        let mut p = Partition::open(dir.path(), &name).unwrap();
         assert_eq!(
-            p.unread(&Pattern::parse("iot_base/**").unwrap(), "reviewer").len(),
+            p.deliver(&Pattern::parse("iot_base/**").unwrap(), "r", usize::MAX).unwrap().len(),
             1,
             "positions are lost, so the retained log is redelivered rather than dropped"
         );
@@ -469,5 +526,60 @@ mod tests {
         let mut rx = p.subscribe_notifications();
         p.publish(msg("iot_base/dev_01", "wake up")).unwrap();
         assert!(rx.try_recv().is_ok(), "a publish must wake blocked waiters");
+    }
+
+    #[test]
+    fn label_is_recorded_for_status_but_affects_nothing() {
+        let dir = TempDir::new().unwrap();
+        let mut p = partition(&dir);
+        p.publish(msg("iot_base/dev_01", "one")).unwrap();
+        let pattern = Pattern::parse("iot_base/**").unwrap();
+        p.deliver(&pattern, "reviewer_01", usize::MAX).unwrap();
+
+        let snapshots = p.pattern_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].label, "reviewer_01");
+        assert_eq!(snapshots[0].key, "iot_base/**");
+        assert!(!snapshots[0].broadcast);
+    }
+
+    #[test]
+    fn broadcast_message_is_delivered_to_each_label_once() {
+        let dir = TempDir::new().unwrap();
+        let mut p = partition(&dir);
+        p.publish(msg("iot_base/announce", "bcast").broadcast()).unwrap();
+
+        let pattern = Pattern::parse("iot_base/**").unwrap();
+        let first = p.deliver(&pattern, "reviewer_01", usize::MAX).unwrap();
+        assert_eq!(first.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["bcast"]);
+
+        // A different label gets its own copy.
+        let second = p.deliver(&pattern, "reviewer_02", usize::MAX).unwrap();
+        assert_eq!(second.len(), 1, "a distinct label must get its own broadcast copy");
+
+        // The same label never gets it twice.
+        let again = p.deliver(&pattern, "reviewer_01", usize::MAX).unwrap();
+        assert!(again.is_empty(), "a label must receive a broadcast message exactly once");
+    }
+
+    /// A broadcast message interleaved with exclusive ones must be delivered in
+    /// id order, once per label for the broadcast and once per pattern for the
+    /// exclusive messages.
+    #[test]
+    fn broadcast_and_exclusive_messages_merge_in_id_order() {
+        let dir = TempDir::new().unwrap();
+        let mut p = partition(&dir);
+        p.publish(msg("iot_base/dev_01", "excl1")).unwrap();
+        p.publish(msg("iot_base/announce", "bcast").broadcast()).unwrap();
+        p.publish(msg("iot_base/dev_01", "excl2")).unwrap();
+
+        let pattern = Pattern::parse("iot_base/**").unwrap();
+        let batch = p.deliver(&pattern, "r1", usize::MAX).unwrap();
+        let bodies: Vec<&str> = batch.iter().map(|m| m.body.as_str()).collect();
+        assert_eq!(bodies, vec!["excl1", "bcast", "excl2"], "delivery must preserve id order");
+
+        // Second label: only the broadcast is left (exclusive messages are gone).
+        let rest = p.deliver(&pattern, "r2", usize::MAX).unwrap();
+        assert_eq!(rest.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["bcast"]);
     }
 }

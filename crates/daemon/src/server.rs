@@ -2,7 +2,7 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use agent_bus_core::{IDLE_SHUTDOWN_SECS, Message, PartitionName, Pattern};
+use agent_bus_core::{IDLE_SHUTDOWN_SECS, PartitionName, Pattern};
 use agent_bus_protocol::{Request, Response, encode};
 use anyhow::{Context, Result};
 use tokio::{
@@ -131,7 +131,7 @@ async fn handle_connection(
                 return Ok(());
             }
 
-            Dispatch::WaitPending { partition, pattern, subscriber, timeout_secs } => {
+            Dispatch::WaitPending { partition, pattern, label, timeout_secs } => {
                 // Clamped rather than rejected: an over-long timeout is a
                 // request to wait "as long as possible", and the ceiling is
                 // what that actually means here.
@@ -139,18 +139,17 @@ async fn handle_connection(
                     timeout_secs.unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS).min(MAX_WAIT_TIMEOUT_SECS),
                 );
                 let response =
-                    wait_for_message(&state, &partition, &pattern, &subscriber, timeout).await;
+                    wait_for_message(&state, &partition, &pattern, &label, timeout).await;
                 send(&mut write_half, &response).await?;
             }
 
-            Dispatch::FollowPending { partition, pattern, subscriber } => {
+            Dispatch::FollowPending { partition, pattern, label } => {
                 // Streams until the client goes away. A stream that breaks must
                 // be reported to the client before the connection closes:
                 // previously the error propagated out of here to the daemon's
                 // stderr, which is /dev/null for an auto-started daemon, and
                 // the client saw a bare EOF and reported success.
-                if let Err(e) =
-                    follow(&state, &partition, &pattern, &subscriber, &mut write_half).await
+                if let Err(e) = follow(&state, &partition, &pattern, &label, &mut write_half).await
                 {
                     let response = Response::Error { message: format!("follow failed: {e:#}") };
                     // Best-effort: if the write also fails the client is
@@ -171,14 +170,14 @@ async fn handle_connection(
 /// Re-checks the log on every notification rather than trusting the payload,
 /// so a dropped or lagged broadcast cannot lose a message.
 ///
-/// Deliberately does not acknowledge: `wait` is at-least-once, and the cursor
-/// only moves when the client sends an explicit `Ack` after it has printed the
-/// message. A client killed between delivery and ack re-reads it next time.
+/// Delivery is exclusive and advances the pattern's position right here: the
+/// message handed back is marked delivered for the whole pattern before this
+/// returns, so no concurrent consumer can also receive it.
 async fn wait_for_message(
     state: &Arc<Mutex<BusState>>,
     partition: &str,
     pattern: &Pattern,
-    subscriber: &str,
+    label: &str,
     timeout: Duration,
 ) -> Response {
     let name = match PartitionName::parse(partition) {
@@ -215,7 +214,7 @@ async fn wait_for_message(
         let found = {
             let mut guard = state.lock().await;
             match guard.partition_mut(&name) {
-                Ok(p) => p.unread(pattern, subscriber).first().map(|m| (*m).clone()),
+                Ok(p) => p.deliver(pattern, label, 1).ok().and_then(|b| b.into_iter().next()),
                 Err(e) => return Response::Error { message: e.to_string() },
             }
         };
@@ -247,7 +246,7 @@ async fn follow(
     state: &Arc<Mutex<BusState>>,
     partition: &str,
     pattern: &Pattern,
-    subscriber: &str,
+    label: &str,
     write_half: &mut OwnedWriteHalf,
 ) -> Result<()> {
     let name = PartitionName::parse(partition)?;
@@ -257,21 +256,19 @@ async fn follow(
     };
 
     loop {
-        // Cloned out of the guard: `unread` borrows from the state, and those
+        // Cloned out of the guard: `deliver` borrows from the state, and those
         // borrows cannot survive the `send` await below.
-        let batch: Vec<Message> = {
+        let batch = {
             let mut guard = state.lock().await;
-            guard.partition_mut(&name)?.unread(pattern, subscriber).into_iter().cloned().collect()
+            guard.partition_mut(&name)?.deliver(pattern, label, usize::MAX)?
         };
 
-        if let Some(last) = batch.last().map(|m| m.id) {
+        if !batch.is_empty() {
             send(write_half, &Response::Messages { messages: batch }).await?;
-            // Advance only after the bytes are out, so a client that dies
-            // mid-write re-reads rather than silently losing messages. Acked
-            // against this follow's own pattern, so it cannot consume messages
-            // another pattern would have delivered to the same subscriber.
-            let mut guard = state.lock().await;
-            guard.partition_mut(&name)?.acknowledge(subscriber, pattern.as_str(), last)?;
+            // Delivery already advanced the pattern's position under the lock,
+            // before the bytes went out. A client that dies mid-write cannot be
+            // handed the batch again — exclusive delivery means a message is
+            // delivered exactly once, not at-least-once.
             continue;
         }
 
@@ -343,9 +340,10 @@ mod tests {
         }
     }
 
-    /// `wait` is at-least-once: the cursor must stay put until the client acks.
+    /// `wait` is exclusive: the delivered message is marked consumed for the
+    /// pattern immediately, so a second wait for the same pattern finds nothing.
     #[tokio::test]
-    async fn wait_does_not_advance_the_cursor() {
+    async fn wait_delivers_a_message_exactly_once() {
         let dir = TempDir::new().unwrap();
         let state = state(&dir);
         state
@@ -360,10 +358,12 @@ mod tests {
             wait_for_message(&state, "iot_base", &pattern(), "reviewer", Duration::from_secs(30))
                 .await;
 
-        let mut guard = state.lock().await;
-        let unread =
-            guard.partition_mut(&name("iot_base")).unwrap().unread(&pattern(), "reviewer").len();
-        assert_eq!(unread, 1, "wait must not acknowledge; the CLI acks explicitly");
+        let response =
+            wait_for_message(&state, "iot_base", &pattern(), "other", Duration::ZERO).await;
+        assert!(
+            matches!(response, Response::Timeout),
+            "the delivered message must not be handed to any second consumer"
+        );
     }
 
     #[tokio::test]

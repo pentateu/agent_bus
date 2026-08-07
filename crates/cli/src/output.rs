@@ -62,16 +62,15 @@ pub fn print_status(status: &StatusReport, json: bool) -> Result<()> {
         if partition.skipped_records > 0 {
             println!("  WARNING: {} corrupt record(s) skipped", partition.skipped_records);
         }
-        for subscriber in &partition.subscribers {
-            let flag =
-                if subscriber.snapped { "  (missed messages: pruned past cursor)" } else { "" };
-            // The pattern is printed because it is half the cursor key: one
-            // subscriber reading two patterns has two independent positions,
-            // and the id alone would render them as two identical lines.
-            println!(
-                "  - {} [{}] lag={}{}",
-                subscriber.id, subscriber.pattern, subscriber.lag, flag
-            );
+        for pattern in &partition.patterns {
+            let flag = if pattern.snapped { "  (missed messages: pruned past cursor)" } else { "" };
+            // The label is shown when one was ever provided: a label is a name
+            // for status, never a delivery identity. The key is the position's
+            // identity — a pattern for exclusive delivery, a consumer label for
+            // broadcast delivery.
+            let who = if pattern.label.is_empty() { "" } else { &pattern.label };
+            let kind = if pattern.broadcast { "bcast" } else { "excl" };
+            println!("  - {who} [{} | {kind}] lag={}{}", pattern.key, pattern.lag, flag);
         }
     }
     Ok(())

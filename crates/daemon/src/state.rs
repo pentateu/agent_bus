@@ -145,7 +145,7 @@ mod tests {
         let other = state.partition_mut(&name("other_project")).unwrap();
         let pattern = Pattern::parse("other_project/**").unwrap();
         assert!(
-            other.unread(&pattern, "spy").is_empty(),
+            other.deliver(&pattern, "spy", usize::MAX).unwrap().is_empty(),
             "a message in iot_base must be invisible to other_project"
         );
     }

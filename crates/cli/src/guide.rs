@@ -66,40 +66,45 @@ rejected — that is the isolation guarantee being enforced. Partial wildcards
 like `dev_*` are not supported; a segment is either a literal, `*`, or `**`.
 
 
-SUBSCRIBER IDENTITY AND CURSORS
+DELIVERY AND CURSORS
 
-The bus remembers what you have already received. That memory is keyed by your
-subscriber id AND the pattern you read with, and it persists across restarts —
-kill your terminal, come back an hour later, and you resume exactly where you
-left off rather than re-reading everything or missing what arrived while you
-were gone.
+Delivery is decided at delivery time, and there are two modes. The default is
+EXCLUSIVE per pattern: each pattern string has exactly one position, shared by
+every consumer that reads with it. When the daemon hands a message out — via
+`wait`, `read`, or `follow` — it marks that message delivered for the whole
+pattern in the same instant. That message will not be returned again to the
+same client, to another client using the same pattern, or to any overlapping
+pattern. There is no separate acknowledgement round-trip, so there is no window
+in which two consumers could both claim the same message.
 
-Because the pattern is part of the key, reading one pattern never consumes
-another's messages, even under the same `--as` id. Waiting on
-`iot_base/dev_01` leaves anything on `iot_base/planner` untouched and still
-unread. Each pattern you use has its own independent position.
+The one pattern, one position model means a pool of workers sharing a pattern
+splits the work between them: whichever worker gets the message first is the
+only one that receives it, which is what makes "first to pick it up does the
+job" true without any coordination.
 
-Your subscriber id defaults to the pattern you subscribe with. So this:
+Broadcast is the exception: a message posted with `--broadcast` is delivered to
+every consumer (distinct `--as` label) whose pattern matches its topic, each
+getting their own copy exactly once. Broadcast positions are keyed per label,
+so a label that already received it never receives it again. See POSTING below.
+
+Because positions belong to the pattern (or, for broadcast, the label), reading
+one pattern never consumes another's messages: waiting on `iot_base/dev_01`
+leaves anything on `iot_base/planner` untouched and unread. Each pattern has
+its own position.
+
+Your label defaults to the pattern you subscribe with, so this:
 
     agent-bus wait 'iot_base/**'
 
-uses the id "iot_base/**" and needs no flag at all. But if TWO agents both
-watch `iot_base/**`, they share one cursor, and what happens then is worth
-knowing exactly. Delivery is AT-LEAST-ONCE: the cursor advances only after a
-message has been printed, so nothing is lost to a crash mid-print. The cost is
-that two agents blocked on the same id at the same moment BOTH receive the
-same message and both act on it — two reviewers reviewing the same commit,
-two agents making the same fix. Read one after the other instead and the
-second sees nothing, because the first already consumed it.
+uses the label "iot_base/**" and needs no flag at all. `--as` is a label for
+`status` output only. It does NOT create a second position, and passing
+different labels does NOT give each consumer its own copy. Two agents that read
+with the same pattern share one position and compete for each message, exactly
+once each. If two agents must each see the same message, give each its own
+pattern (its own inbox), not its own label.
 
-Neither outcome is what you want. Give them distinct identities:
-
-    agent-bus wait 'iot_base/**' --as reviewer_01
-    agent-bus wait 'iot_base/**' --as reviewer_02
-
-Now each gets its own copy of every matching message. Rule of thumb: if you are
-the only agent on a pattern, omit `--as`; otherwise always pass it, and use the
-same value every time so your cursor is continuous.
+The only way to see a delivered message again is `history`, which ignores
+positions entirely and replays whatever is still retained.
 
 
 THE TWO WAYS TO RECEIVE
@@ -132,6 +137,10 @@ self-terminating:
         # handle the message, then block again
     done
 
+Because delivery is exclusive, this loop is also load-balanced across workers:
+if three reviewers run the same loop on `iot_base/reviews`, each message wakes
+exactly one of them.
+
 2. HOOK DELIVERY — when you want to keep working and be told as you go
 
     agent-bus hook install opencode 'iot_base/**' --as dev_01     writes a file
@@ -154,8 +163,9 @@ and would otherwise go idle. If you need to act on a message the moment it
 lands, hooks are the wrong mechanism; use `wait`.
 
 Use `wait` when you are blocked on someone. Use hooks when you are busy and
-want ambient awareness. They can be combined, but give them different `--as`
-ids so they do not consume each other's messages.
+want ambient awareness. A hook and a `wait` on the SAME pattern compete for the
+same messages: whichever runs first takes a message, and the other never sees
+it. Do not run both on one pattern unless you want them to split the load.
 
 
 POSTING
@@ -167,6 +177,16 @@ The topic must be concrete. The body may be given as an argument, or piped:
     git diff | agent-bus post iot_base/reviewer_01
 
 Flags:
+
+    --broadcast   deliver this message to EVERY consumer whose pattern matches
+                  the topic, each getting their own copy once. Without it,
+                  delivery is exclusive per pattern — the first consumer to
+                  read it takes it and nobody else sees it. Use --broadcast for
+                  announcements every agent should see (e.g. a project-wide
+                  finding); use the default for work handed to one agent (e.g.
+                  a review request). A broadcast message is delivered once per
+                  distinct `--as` label: two agents sharing a label are the
+                  same consumer and only one gets it.
 
     --priority high   a delivery hint for the receiver. The bus does not act
                       on it and does not deliver it any faster. It travels with
@@ -192,19 +212,19 @@ nothing. Use it to check in without committing to a block.
 Streams messages continuously until interrupted. Useful for a human watching a
 terminal; rarely what an agent wants, since it never returns.
 
-`follow` CONSUMES what it streams: the cursor advances as messages go out, so
-anything it prints is gone from that subscriber's unread queue for that
-pattern. If you leave a `follow` running under the same `--as` id AND the same
-pattern you use for `wait` or `read`, it will quietly swallow every message
-before those commands ever see one. Give a `follow` its own `--as` id — `--as
-watcher` — whenever another command reads the same pattern.
+`follow` CONSUMES what it streams: the pattern's position advances as messages
+go out, so anything it prints is delivered and will never be returned by a
+later `wait` or `read` on the same pattern. Do not run a `follow` on the same
+pattern as a `wait` or `read` unless you intend the `follow` to take the
+messages first.
 
     agent-bus history 'iot_base/**' --since 10m
 
 Replays past messages and IGNORES CURSORS entirely — it does not consume
 anything and does not move your position, so it is always safe to run. With no
 `--since` it returns the entire retained window. This is how you rebuild
-context after a restart.
+context after a restart, and the only way to see messages that were already
+delivered.
 
 
 RETENTION AND LIFECYCLE
@@ -240,14 +260,16 @@ Pass `--json` to any command for machine-readable output. Messages are printed
 one JSON object per line:
 
     {"id":"01J...","ts":"2026-01-01T12:00:00Z","topic":"iot_base/dev_01",
-     "priority":"normal","from":"dev_01","body":"ready for review"}
+     "priority":"normal","from":"dev_01","body":"ready for review",
+     "broadcast":false}
 
-    id        ULID, sortable by creation time; also the cursor value
-    ts        RFC 3339 timestamp
-    topic     the full concrete topic
-    priority  "normal" or "high"
-    from      sender name
-    body      the message text
+    id         ULID, sortable by creation time; also the cursor value
+    ts         RFC 3339 timestamp
+    topic      the full concrete topic
+    priority   "normal" or "high"
+    from       sender name
+    body       the message text
+    broadcast  true if this was posted with --broadcast
 
 `status --json` emits the full report as a single pretty-printed object.
 
@@ -276,16 +298,17 @@ WORKED EXAMPLES
 
 2. Broadcasting a finding to everyone.
 
-   You discover something every agent on the project needs to know. Post it to
-   a shared topic rather than to each inbox:
+   You discover something every agent on the project needs to know. Post it
+   with `--broadcast` to a shared topic:
 
        agent-bus post iot_base/bugs_found "the retry helper drops the last \
-       error; anything relying on its message is wrong"
+       error; anything relying on its message is wrong" --broadcast
 
-   Any agent subscribed to `iot_base/**` or `iot_base` receives it, each with
-   its own cursor, so nobody consumes it away from anyone else. Use
-   `iot_base/lessons_learned` for durable knowledge and `iot_base/bugs_found`
-   for defects.
+   Every agent subscribed to `iot_base/**` or `iot_base` receives it, each with
+   their own copy, so nobody consumes it away from anyone else. Without
+   `--broadcast`, the first reader would take it and the rest would never know.
+   Use `--broadcast` for `iot_base/lessons_learned` and `iot_base/bugs_found`,
+   which are durable shared knowledge, not work for one agent.
 
 3. Rebuilding context after a restart.
 
@@ -332,6 +355,7 @@ mod tests {
             "wait",
             "hook install",
             "--priority high",
+            "--broadcast",
             "history",
             "follow",
             "--json",

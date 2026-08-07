@@ -36,6 +36,15 @@ pub struct Message {
     pub priority: Priority,
     pub from: String,
     pub body: String,
+    /// Broadcast messages are delivered to every consumer (distinct `--as`
+    /// label) whose pattern matches the topic, each getting their own copy
+    /// once. Normal messages are exclusive: the first consumer to read the
+    /// pattern takes the message and it is delivered to no one else.
+    ///
+    /// `#[serde(default)]` keeps logs written before this field existed
+    /// readable: a record without it is a normal (exclusive) message.
+    #[serde(default)]
+    pub broadcast: bool,
 }
 
 impl Message {
@@ -48,7 +57,14 @@ impl Message {
         let from = from.unwrap_or_else(|| {
             topic.as_str().rsplit('/').next().unwrap_or(topic.as_str()).to_owned()
         });
-        Self { id: next_id(), ts: now_rfc3339(), topic, priority, from, body }
+        Self { id: next_id(), ts: now_rfc3339(), topic, priority, from, body, broadcast: false }
+    }
+
+    /// Mark this message as a broadcast.
+    #[must_use]
+    pub fn broadcast(mut self) -> Self {
+        self.broadcast = true;
+        self
     }
 
     /// Serialize to a single JSONL line (no trailing newline).

@@ -20,9 +20,7 @@ pub const SIZE_BUCKETS_BYTES: &[u64] =
 /// cells where cell 0 is `< boundaries[0]` and the final cell is `>=` the last
 /// boundary. A value equal to a boundary goes into the bin that STARTS at that
 /// boundary: 10ms lands in the `[10,25)` bin, not the `[0,10)` bin.
-// TODO(wiring): dead code until the instrumentation tasks land; remove the
 // allows once publish/deliver/prune bump the tallies.
-#[allow(dead_code)]
 #[must_use]
 pub fn bin_index(boundaries: &[u64], value: u64) -> usize {
     // Count of boundaries `<= value` is exactly the bin index: every boundary
@@ -32,7 +30,6 @@ pub fn bin_index(boundaries: &[u64], value: u64) -> usize {
 }
 
 /// Cross-partition histograms, owned by [`crate::state::BusState`].
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct BusTally {
     latency_hist: Vec<u64>,
@@ -40,13 +37,11 @@ pub struct BusTally {
 }
 
 /// A cheap snapshot of both histograms for `build_metrics`.
-#[allow(dead_code)]
 pub struct TallySnapshot<'a> {
     pub latency_hist: &'a [u64],
     pub size_hist: &'a [u64],
 }
 
-#[allow(dead_code)]
 impl BusTally {
     #[must_use]
     pub fn new() -> Self {
@@ -79,7 +74,6 @@ impl Default for BusTally {
 }
 
 /// Per-partition cumulative counters, owned by [`crate::partition::Partition`].
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct PartitionTally {
     pub posts: u64,
@@ -91,7 +85,6 @@ pub struct PartitionTally {
     pub snapped: u64,
 }
 
-#[allow(dead_code)]
 impl PartitionTally {
     #[must_use]
     pub fn new() -> Self {

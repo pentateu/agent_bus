@@ -24,8 +24,6 @@ pub struct BusState {
     /// Last time any client did anything, for idle shutdown.
     last_activity: Instant,
     /// Cumulative, never-decremented counters and histograms for the dashboard.
-    // TODO(wiring): dead until `build_metrics` lands; remove with it.
-    #[allow(dead_code)]
     pub bus_tally: BusTally,
 }
 
@@ -95,11 +93,20 @@ impl BusState {
         self.started.elapsed().as_secs()
     }
 
-    // TODO(wiring): dead until `build_metrics` lands; remove with it.
-    #[allow(dead_code)]
     #[must_use]
     pub fn bus_tally(&self) -> &BusTally {
         &self.bus_tally
+    }
+    /// Record one delivered message's post-to-delivery latency, in
+    /// milliseconds, into the cross-partition histogram.
+    ///
+    /// Called by the handler whenever a deliver returns messages: for
+    /// exclusive delivery that is once per message, for broadcast once per
+    /// consumer label that receives it, which is the "how long until each
+    /// agent picked it up" shape the dashboard graphs.
+    pub fn record_delivery_latency(&mut self, post_ms: u64) {
+        let now_ms = crate::handler::now_millis();
+        self.bus_tally.record_delivery(now_ms.saturating_sub(post_ms));
     }
 
     /// Prune every partition. Returns the total number of messages removed.

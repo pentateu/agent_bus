@@ -75,8 +75,6 @@ pub struct Partition {
     labels: std::collections::BTreeMap<String, String>,
     /// Cumulative per-partition counters for the dashboard. Bumped inside
     /// `publish` / `deliver` / `prune`, which already run under the state lock.
-    // TODO(wiring): dead until the instrumentation tasks land; remove with them.
-    #[allow(dead_code)]
     tally: PartitionTally,
     notify: broadcast::Sender<()>,
 }
@@ -161,11 +159,15 @@ impl Partition {
         self.name.as_str()
     }
 
-    // TODO(wiring): dead until `build_metrics` lands; remove with it.
-    #[allow(dead_code)]
     #[must_use]
     pub fn tally(&self) -> &PartitionTally {
         &self.tally
+    }
+
+    /// Every retained message, in id order. Used by `build_metrics` to derive
+    /// publishers and topic counts from what the log actually holds.
+    pub fn log_messages(&self) -> impl Iterator<Item = &Message> {
+        self.log.messages().iter()
     }
 
     /// Receive a signal whenever a message is published here.

@@ -126,7 +126,7 @@ async fn handle_connection(
         // across a client write would let one slow reader stall every publisher.
         let outcome = {
             let mut guard = state.lock().await;
-            dispatch(&mut guard, request)
+            dispatch(&mut guard, request, &active_waiters, &active_followers)
         };
 
         match outcome {
@@ -320,6 +320,15 @@ async fn follow(
         };
 
         if !batch.is_empty() {
+            // The state guard is released before the send below; the latency
+            // is recorded now, under the lock, so a slow reader does not skew
+            // "time to pick up" with how long the socket write took.
+            {
+                let mut guard = state.lock().await;
+                for m in &batch {
+                    guard.record_delivery_latency(m.id.timestamp_ms());
+                }
+            }
             send(write_half, &Response::Messages { messages: batch }).await?;
             // Delivery already advanced the pattern's position under the lock,
             // before the bytes went out. A client that dies mid-write cannot be

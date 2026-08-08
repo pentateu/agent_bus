@@ -1,7 +1,3 @@
-// The dashboard module's surface is not reachable until the `dashboard`
-// subcommand (Task 7) drives it; the allow goes with that wiring.
-#![allow(dead_code)]
-
 //! Rendering for the dashboard: a pure draw of `App` into a ratatui frame.
 //!
 //! No terminal I/O happens here — `draw` only builds widgets, so unit tests
@@ -16,12 +12,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Chart, Dataset, Gauge, Paragraph, Table},
 };
-
-/// One terminal event the command layer turns into an app tick.
-pub enum DBEvent {
-    Tick,
-    Key(char),
-}
 
 /// Six-row grid: header, throughput, latency ("time to pick up"), message
 /// size, gauges, table.

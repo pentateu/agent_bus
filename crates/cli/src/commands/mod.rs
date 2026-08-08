@@ -1,6 +1,7 @@
 //! One module per subcommand. Each returns the process exit code.
 
 pub mod daemon;
+pub mod dashboard;
 pub mod follow;
 pub mod history;
 pub mod hook;

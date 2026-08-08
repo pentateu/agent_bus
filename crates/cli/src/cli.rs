@@ -134,6 +134,11 @@ pub enum Command {
     /// Show daemon state, partitions, and subscriber lag.
     Status,
 
+    /// Live TUI of daemon metrics: rates, latencies, sizes, tables.
+    ///
+    /// Needs a terminal. Quit with `q`.
+    Dashboard,
+
     /// Shut the daemon down.
     Stop,
 

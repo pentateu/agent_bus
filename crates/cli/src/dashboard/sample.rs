@@ -11,18 +11,17 @@ use agent_bus_protocol::MetricsReport;
 /// same array on every response, so a client may use those instead; this
 /// constant exists so tests do not have to construct a full report just to
 /// get bucket boundaries.
-#[allow(dead_code)] // wired into `app`/`ui` in Task 6; remove the allow with it.
+#[allow(dead_code)] // tests only; the dashboard uses daemon-sent boundaries.
 pub const LATENCY_BUCKETS_MS: &[u64] =
     &[0, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000];
 
 #[must_use]
-#[allow(dead_code)] // wired into `app` in Task 6; remove the allow with it.
+#[allow(dead_code)] // tests only; the daemon sends real boundaries on each report.
 pub fn bin_index(boundaries: &[u64], value: u64) -> usize {
     boundaries.iter().filter(|&&b| b <= value).count()
 }
 
 /// One poll's worth of derived numbers, suitable for appending to a series.
-#[allow(dead_code)] // wired into `app` in Task 6; remove the allow with it.
 pub struct Diff {
     /// Raw counts for THIS interval — the minute buckets accumulate these,
     /// never the rates (an average of averages would skew).
@@ -39,30 +38,15 @@ pub struct Diff {
     /// p95 of this interval, in ms (the bucket's lower bound — good enough for
     /// a sparkline; the UI rounds to the bucket label).
     pub p95_latency_ms: u64,
-    /// Rates over the elapsed interval, for the UI's current-rate readouts.
-    pub posts_per_sec: f64,
-    pub deliveries_per_sec: f64,
-    pub bytes_per_sec: f64,
-}
-
-/// Counts per second, as an `f64`.
-///
-/// Casts are fine here: the numerator and denominator are small counters and
-/// elapsed seconds, and a rate is only ever rendered or compared loosely.
-#[allow(clippy::cast_precision_loss, dead_code)] // dead until `app` lands in Task 6.
-fn per_second(delta: u64, secs: u64) -> f64 {
-    delta as f64 / secs.max(1) as f64
 }
 
 /// Diff two reports. Returns `None` if the daemon restarted between them
 /// (uptime shrank or pid changed), in which case the caller drops the diff
 /// and tags a rebaseline.
-#[allow(dead_code)] // wired into `app` in Task 6; remove the allow with it.
 pub struct Sample;
 impl Sample {
     #[must_use]
-    #[allow(dead_code)] // dead until `app` lands in Task 6.
-    pub fn diff(prev: &MetricsReport, cur: &MetricsReport, elapsed_secs: u64) -> Option<Diff> {
+    pub fn diff(prev: &MetricsReport, cur: &MetricsReport) -> Option<Diff> {
         if cur.uptime_secs < prev.uptime_secs || cur.pid != prev.pid {
             return None;
         }
@@ -95,22 +79,16 @@ impl Sample {
         };
 
         let size_sum_bytes = weighted_mid(&size_delta, &cur.size_buckets_bytes);
-        let posts_delta = cur.totals.posts.saturating_sub(prev.totals.posts);
-        let deliveries_delta = cur.totals.deliveries.saturating_sub(prev.totals.deliveries);
-        let bytes_delta = cur.totals.bytes_posted.saturating_sub(prev.totals.bytes_posted);
 
         Some(Diff {
-            posts_delta,
-            deliveries_delta,
-            bytes_delta,
+            posts_delta: cur.totals.posts.saturating_sub(prev.totals.posts),
+            deliveries_delta: cur.totals.deliveries.saturating_sub(prev.totals.deliveries),
+            bytes_delta: cur.totals.bytes_posted.saturating_sub(prev.totals.bytes_posted),
             latency_delta,
             size_delta,
             latency_sum_ms,
             size_sum_bytes,
             p95_latency_ms,
-            posts_per_sec: per_second(posts_delta, elapsed_secs),
-            deliveries_per_sec: per_second(deliveries_delta, elapsed_secs),
-            bytes_per_sec: per_second(bytes_delta, elapsed_secs),
         })
     }
 }
@@ -122,12 +100,7 @@ impl Sample {
 /// The casts are deliberate: `q` is a literal like `0.95` and totals here are
 /// small poll deltas, far below `2^53`, so neither precision nor sign can
 /// actually be lost.
-#[allow(
-    dead_code, // wired into `app` in Task 6; remove the allow with it.
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
 #[must_use]
 pub fn percentile_bucket(histogram: &[u64], q: f64) -> usize {
     let total: u64 = histogram.iter().sum();
@@ -146,10 +119,9 @@ pub fn percentile_bucket(histogram: &[u64], q: f64) -> usize {
     histogram.len() - 1
 }
 
-/// Sum of bucket midpoints weighted by each bucket's count, as a total (not
-/// averaged); the caller divides by sample count for an average. Midpoints
-/// approximate, which is the honest price of bucketing.
-#[allow(dead_code)] // wired into `app` in Task 6; remove the allow with it.
+/// Sum of the bucket midpoints weighted by each bucket's count, as a total
+/// (not an average); the caller divides by sample count. Midpoints approximate,
+/// which is the honest price of bucketing.
 fn weighted_mid(histogram: &[u64], boundaries: &[u64]) -> u64 {
     let mut sum: u64 = 0;
     for (i, &count) in histogram.iter().enumerate() {
@@ -197,35 +169,29 @@ mod tests {
         }
     }
 
-    /// `float_cmp` pedantic forbids `==` on f64; rates are derived, so compare
-    /// with a tolerance that survives the division rounding.
-    fn assert_close(actual: f64, expected: f64) {
-        assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
-    }
-
     #[test]
-    fn diff_yields_per_second_rate() {
+    fn diff_carries_the_raw_deltas() {
         let prev = report(10, 8, 100, 1);
         let cur = report(13, 9, 101, 1);
-        let d = Sample::diff(&prev, &cur, 1).unwrap();
-        assert_close(d.posts_per_sec, 3.0);
-        assert_close(d.deliveries_per_sec, 1.0);
+        let d = Sample::diff(&prev, &cur).unwrap();
+        assert_eq!(d.posts_delta, 3);
+        assert_eq!(d.deliveries_delta, 1);
     }
 
     #[test]
-    fn diff_over_a_longer_interval_divides_by_elapsed_seconds() {
+    fn diff_over_a_longer_interval_spans_the_same_deltas() {
         let prev = report(10, 8, 100, 1);
-        let cur = report(40, 18, 110, 1); // 10s elapsed
-        let d = Sample::diff(&prev, &cur, 10).unwrap();
-        assert_close(d.posts_per_sec, 3.0);
-        assert_close(d.deliveries_per_sec, 1.0);
+        let cur = report(40, 18, 110, 1);
+        let d = Sample::diff(&prev, &cur).unwrap();
+        assert_eq!(d.posts_delta, 30);
+        assert_eq!(d.deliveries_delta, 10);
     }
 
     #[test]
     fn a_daemon_restart_returns_none() {
         let prev = report(10, 8, 500, 1);
         let cur = report(0, 0, 2, 2); // fresh daemon, pid changed, uptime shrank
-        assert!(Sample::diff(&prev, &cur, 1).is_none());
+        assert!(Sample::diff(&prev, &cur).is_none());
     }
 
     #[test]

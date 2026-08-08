@@ -1,7 +1,3 @@
-// The tick/flush surface is only reachable once the `dashboard` subcommand
-// (Task 7) drives it; the allow goes with that wiring.
-#![allow(dead_code)]
-
 //! App state for the dashboard's rolling one-hour view.
 //!
 //! `App` is pure state: every poll produces a new `App` via [`App::tick`].
@@ -85,16 +81,8 @@ impl Series {
 
     /// Average delivery latency so far this minute, in ms.
     #[must_use]
-    #[allow(dead_code)] // wired into `ui` in Task 6; remove the allow with it.
     pub fn avg_latency_ms(&self) -> u64 {
         self.cur_latency_sum_ms.checked_div(self.cur_latency_samples.max(1)).unwrap_or(0)
-    }
-
-    /// Average posted message size so far this minute, in bytes.
-    #[must_use]
-    #[allow(dead_code)] // wired into `ui` in Task 6; remove the allow with it.
-    pub fn avg_size_bytes(&self) -> u64 {
-        self.cur_size_sum.checked_div(self.cur_size_samples.max(1)).unwrap_or(0)
     }
 }
 
@@ -128,12 +116,6 @@ impl App {
         self.prev.as_ref()
     }
 
-    #[must_use]
-    #[allow(dead_code)] // wired into `ui` in Task 6; remove the allow with it.
-    pub fn had_restart(&self) -> bool {
-        self.had_restart
-    }
-
     /// `poll_at_ms` of the poll that detected a restart — for the header's
     /// "telemetry reset" note. `None` until a restart has been seen.
     #[must_use]
@@ -146,7 +128,7 @@ impl App {
     /// boundary. A restart (diff `None`) rebaselines without a spike.
     pub fn tick(&mut self, report: &MetricsReport, elapsed_secs: u64) {
         if let Some(prev) = &self.prev {
-            if let Some(diff) = Sample::diff(prev, report, elapsed_secs) {
+            if let Some(diff) = Sample::diff(prev, report) {
                 self.series.cur_posts = self.series.cur_posts.saturating_add(diff.posts_delta);
                 self.series.cur_deliveries =
                     self.series.cur_deliveries.saturating_add(diff.deliveries_delta);

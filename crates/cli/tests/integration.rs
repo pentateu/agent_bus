@@ -1315,3 +1315,24 @@ fn hook_install_dry_run_writes_nothing() {
     let unknown = bus(state, &["hook", "install", "not-a-harness", "iot_base/**", "--dry-run"]);
     assert_ne!(code(&unknown), 0, "an unknown harness must be rejected");
 }
+
+/// The dashboard is a TUI: with a non-terminal stdout it must refuse to start
+/// rather than assume a terminal is attached. Exit 1 (usage), no hang, and no
+/// daemon spawned on this path.
+#[test]
+fn dashboard_refuses_without_a_terminal() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path();
+
+    let output = bus(state, &["dashboard"]);
+    assert_eq!(code(&output), 1, "must refuse a TTY-less terminal");
+    assert!(
+        stderr(&output).contains("terminal"),
+        "must explain it needs a terminal: {}",
+        stderr(&output)
+    );
+    assert!(
+        !state.join("agent-bus.sock").exists(),
+        "must not auto-start a daemon it cannot display"
+    );
+}

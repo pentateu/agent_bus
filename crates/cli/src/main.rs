@@ -91,6 +91,8 @@ fn run(args: Cli) -> anyhow::Result<ExitCode> {
 
         Command::Status => commands::status::run(json),
 
+        Command::Dashboard => commands::dashboard::run(),
+
         Command::Stop => commands::stop::run(json),
 
         Command::Guide => {

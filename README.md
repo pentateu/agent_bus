@@ -65,6 +65,7 @@ restarts on the next command.
 | `stop` | Shut the daemon down |
 | `guide` | Full usage guide, written for AI agents |
 | `hook install <harness>` | Wire up Claude Code or OpenCode delivery |
+| `dashboard` | Live TUI: per-minute throughput, latency "time to pick up", message sizes, gauges, partition tables (quit with `q`) |
 
 Add `--json` to any command for machine-readable output. Add `--broadcast` to
 `post` to deliver a message to every consumer whose pattern matches, rather

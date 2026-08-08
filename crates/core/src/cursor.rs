@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -22,6 +22,14 @@ use crate::error::CoreError;
 ///   broadcast position, so two consumers that use the same `--as` value would
 ///   split broadcast delivery; give each consumer its own label.
 ///
+/// * **Delivered** ids are a per-label record of every message that label has
+///   actually received. This closes the overlap gap the two position sets
+///   cannot: `iot_base/dev_01` and `iot_base/*` are different patterns with
+///   different positions, so a message matching both would otherwise be handed
+///   to the same label twice — once through each pattern. The delivered set is
+///   checked before delivery and pruned with the log, so it never outlives
+///   retention.
+///
 /// The only way to see a delivered message again is `history`, which ignores
 /// positions entirely.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -30,6 +38,10 @@ pub struct CursorStore {
     exclusive: BTreeMap<String, Ulid>,
     /// Broadcast per-label positions: label -> last delivered id.
     broadcast: BTreeMap<String, Ulid>,
+    /// Message ids each label has received, so overlapping patterns cannot
+    /// double-deliver to the same consumer.
+    #[serde(default)]
+    delivered: BTreeMap<String, BTreeSet<Ulid>>,
 }
 
 impl CursorStore {
@@ -66,6 +78,37 @@ impl CursorStore {
                 }
             })
             .or_insert(id);
+    }
+
+    /// Has this label already received the given message?
+    ///
+    /// The delivered set is the exclusive side of the overlap guarantee:
+    /// a label must not receive one message twice merely because two of its
+    /// patterns (`iot_base/dev_01` and `iot_base/*`) both select it. Position
+    /// keys cannot express this, because positions are shared per pattern while
+    /// delivery is per label — advancing a pattern past a message would hide it
+    /// from a *different* label that has not seen it yet.
+    #[must_use]
+    pub fn is_delivered(&self, label: &str, id: Ulid) -> bool {
+        self.delivered.get(label).is_some_and(|ids| ids.contains(&id))
+    }
+
+    /// Record that `label` received `id`.
+    pub fn mark_delivered(&mut self, label: &str, id: Ulid) {
+        self.delivered.entry(label.to_owned()).or_default().insert(id);
+    }
+
+    /// Drop delivered records for messages pruned out of the log, so the
+    /// per-label sets do not grow without bound as old messages age away.
+    ///
+    /// A delivered record for a pruned message is pure memory: the message no
+    /// longer exists, so it can never be delivered again regardless of what the
+    /// set says.
+    pub fn prune_delivered(&mut self, oldest_surviving: Ulid) {
+        self.delivered.retain(|_, ids| {
+            ids.retain(|id| *id >= oldest_surviving);
+            !ids.is_empty()
+        });
     }
 
     /// After pruning, drag any cursor older than `oldest_surviving` forward to
@@ -115,16 +158,39 @@ impl CursorStore {
     /// Parse a cursor file. Empty input yields an empty store, so a missing or
     /// freshly created file is not an error.
     ///
+    /// Accepts the current `{ exclusive, broadcast, delivered }` shape and
+    /// migrates the pre-exclusive nested format `{ subscriber: { pattern: id } }`
+    /// so an upgrade never wipes read positions and re-delivers retained
+    /// messages. The migration keeps the furthest position each pattern reached
+    /// under any subscriber — the subscriber dimension no longer exists, so this
+    /// is the closest lossless-enough mapping: messages already consumed stay
+    /// consumed, and the risk is a slightly-ahead position, never a duplicate.
+    ///
     /// # Errors
-    /// Returns [`CoreError::MalformedRecord`] if non-empty input is not valid
-    /// JSON in the current `{ exclusive, broadcast }` shape. A file written by
-    /// an older build lands here too; see [`Self::from_json_or_reset`] for the
-    /// recovery the daemon applies.
+    /// Returns [`CoreError::MalformedRecord`] if non-empty input is neither the
+    /// current shape nor the legacy nested shape.
     pub fn from_json(input: &str) -> Result<Self, CoreError> {
         if input.trim().is_empty() {
             return Ok(Self::default());
         }
-        serde_json::from_str(input).map_err(|e| CoreError::MalformedRecord(e.to_string()))
+        // Current shape first.
+        if let Ok(store) = serde_json::from_str::<Self>(input) {
+            return Ok(store);
+        }
+        // Legacy nested shape: subscriber -> pattern -> id.
+        if let Ok(legacy) = serde_json::from_str::<BTreeMap<String, BTreeMap<String, Ulid>>>(input)
+        {
+            let mut store = Self::default();
+            for patterns in legacy.values() {
+                for (pattern, id) in patterns {
+                    store.advance_exclusive(pattern, *id);
+                }
+            }
+            return Ok(store);
+        }
+        Err(CoreError::MalformedRecord(
+            "not the current or the legacy cursor file format".to_owned(),
+        ))
     }
 
     /// Parse a cursor file, falling back to an empty store on unreadable input.
@@ -133,13 +199,13 @@ impl CursorStore {
     /// which the caller is expected to log. The reason is handed back rather
     /// than printed here because this crate does no I/O.
     ///
-    /// Resetting rather than failing is deliberate. Older cursor formats are
-    /// not mechanically convertible, and there is no migration by design: this
-    /// is pre-1.0 software with a one-hour retention window, so the worst
-    /// outcome of starting fresh is that unread messages are redelivered —
-    /// which, under exclusive delivery, means they are handed out again exactly
-    /// once. Whereas refusing to open the partition would take the whole bus
-    /// down over a file that will be irrelevant within the hour.
+    /// Resetting rather than failing is deliberate. A file that is neither the
+    /// current format nor the legacy nested format is likely torn or foreign;
+    /// with one-hour retention, the worst outcome of starting fresh is that
+    /// unread messages are redelivered — which, under exclusive delivery, means
+    /// they are handed out again exactly once. Whereas refusing to open the
+    /// partition would take the whole bus down over a file that will be
+    /// irrelevant within the hour.
     ///
     /// Losing the positions silently would not be defensible; that is why the
     /// reason comes back instead of being swallowed.
@@ -149,6 +215,43 @@ impl CursorStore {
             Ok(store) => (store, None),
             Err(e) => (Self::default(), Some(e.to_string())),
         }
+    }
+
+    /// Parse a legacy nested cursor file and report whether migration happened.
+    ///
+    /// `None` means the input was already current-format or empty. A `Some` is
+    /// the list of legacy `(subscriber, pattern, id)` triples that were folded
+    /// into per-pattern positions. The daemon uses them to seed the per-label
+    /// delivered set from its log, so a label that consumed a message under the
+    /// old model is not handed it again by an overlapping pattern after the
+    /// upgrade.
+    #[must_use]
+    pub fn legacy_triples(input: &str) -> Option<Vec<(String, String, Ulid)>> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // A current-format file is not legacy, even though its inner values are
+        // also ULID strings: without this guard, `{"exclusive": {...}}` would be
+        // read as the legacy subscriber "exclusive".
+        if trimmed.starts_with('{')
+            && (trimmed.contains("\"exclusive\"") || trimmed.contains("\"broadcast\""))
+        {
+            return None;
+        }
+        let triples: BTreeMap<String, BTreeMap<String, Ulid>> =
+            serde_json::from_str(trimmed).ok()?;
+        if triples.is_empty() {
+            return None;
+        }
+        Some(
+            triples
+                .into_iter()
+                .flat_map(|(sub, patterns)| {
+                    patterns.into_iter().map(move |(pattern, id)| (sub.clone(), pattern, id))
+                })
+                .collect(),
+        )
     }
 }
 
@@ -305,17 +408,24 @@ mod tests {
         assert_eq!(CursorStore::from_json("").unwrap().exclusive_position(P), None);
     }
 
-    /// A cursor file from an older single-map format is not convertible, so it
-    /// must reset to empty *and* hand back a reason for the caller to log
-    /// rather than dropping the positions silently.
+    /// A cursor file from the legacy nested `subscriber -> pattern -> id` format
+    /// must migrate into the current exclusive-per-pattern positions, not reset:
+    /// an upgrade must never wipe read positions and re-deliver retained
+    /// messages. The furthest position each pattern reached under any subscriber
+    /// is kept — the subscriber dimension no longer exists.
     #[test]
-    fn old_format_resets_and_reports_a_reason() {
-        let old = r#"{"iot_base/**":"01J000000000000000000000"}"#;
-        assert!(CursorStore::from_json(old).is_err(), "the old flat format must not parse");
-
-        let (store, reason) = CursorStore::from_json_or_reset(old);
-        assert_eq!(store.exclusive_position(P), None);
-        assert!(reason.is_some(), "an unreadable cursor file must not be discarded silently");
+    fn legacy_nested_format_migrates_instead_of_resetting() {
+        let v = ids(3);
+        let old = format!(
+            r#"{{"reviewer":{{"iot_base/dev_01":"{0}","iot_base/planner":"{1}"}},"dev":{{"iot_base/dev_01":"{2}"}}}}"#,
+            v[0], v[1], v[2]
+        );
+        let store = CursorStore::from_json(&old).unwrap();
+        // Furthest id per pattern wins: the dev read dev_01 further than the
+        // reviewer did, so the pattern's shared position is the dev's.
+        assert_eq!(store.exclusive_position("iot_base/dev_01"), Some(v[2]));
+        assert_eq!(store.exclusive_position("iot_base/planner"), Some(v[1]));
+        assert!(store.broadcast_cursors().next().is_none());
     }
 
     #[test]
@@ -326,5 +436,40 @@ mod tests {
         let (back, reason) = CursorStore::from_json_or_reset(&store.to_json().unwrap());
         assert_eq!(reason, None, "a readable file must not be reported as damaged");
         assert_eq!(back.exclusive_position(P), Some(v[0]));
+    }
+
+    #[test]
+    fn delivered_records_are_per_label() {
+        let mut store = CursorStore::default();
+        let v = ids(2);
+        store.mark_delivered("dev", v[0]);
+        assert!(store.is_delivered("dev", v[0]));
+        assert!(!store.is_delivered("dev", v[1]), "a label only records what it received");
+        assert!(!store.is_delivered("opencode-hook", v[0]), "delivered is per label");
+    }
+
+    #[test]
+    fn delivered_survives_a_roundtrip() {
+        let mut store = CursorStore::default();
+        let v = ids(2);
+        store.mark_delivered("dev", v[0]);
+        store.mark_delivered("dev", v[1]);
+        let back = CursorStore::from_json(&store.to_json().unwrap()).unwrap();
+        assert!(back.is_delivered("dev", v[0]));
+        assert!(back.is_delivered("dev", v[1]));
+    }
+
+    #[test]
+    fn prune_delivered_drops_pruned_message_records() {
+        let mut store = CursorStore::default();
+        let v = ids(3);
+        store.mark_delivered("dev", v[0]);
+        store.mark_delivered("dev", v[1]);
+        store.mark_delivered("other", v[0]);
+        // v[1] is the oldest surviving message; v[0] is gone.
+        store.prune_delivered(v[1]);
+        assert!(!store.is_delivered("dev", v[0]));
+        assert!(store.is_delivered("dev", v[1]));
+        assert!(!store.is_delivered("other", v[0]), "empty label sets are dropped");
     }
 }

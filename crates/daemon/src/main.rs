@@ -6,6 +6,7 @@
 
 mod handler;
 mod log;
+mod metrics;
 mod partition;
 mod server;
 mod state;

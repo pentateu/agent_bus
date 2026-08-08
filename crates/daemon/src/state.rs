@@ -12,6 +12,7 @@ use std::{
 use agent_bus_core::{PartitionName, RetentionPolicy};
 use anyhow::Result;
 
+use crate::metrics::BusTally;
 use crate::partition::Partition;
 
 /// All daemon state: one entry per partition, created on demand.
@@ -22,6 +23,10 @@ pub struct BusState {
     started: Instant,
     /// Last time any client did anything, for idle shutdown.
     last_activity: Instant,
+    /// Cumulative, never-decremented counters and histograms for the dashboard.
+    // TODO(wiring): dead until `build_metrics` lands; remove with it.
+    #[allow(dead_code)]
+    pub bus_tally: BusTally,
 }
 
 impl BusState {
@@ -34,6 +39,7 @@ impl BusState {
             policy: RetentionPolicy::default(),
             started: now,
             last_activity: now,
+            bus_tally: BusTally::new(),
         }
     }
 
@@ -87,6 +93,13 @@ impl BusState {
     #[must_use]
     pub fn uptime_secs(&self) -> u64 {
         self.started.elapsed().as_secs()
+    }
+
+    // TODO(wiring): dead until `build_metrics` lands; remove with it.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn bus_tally(&self) -> &BusTally {
+        &self.bus_tally
     }
 
     /// Prune every partition. Returns the total number of messages removed.

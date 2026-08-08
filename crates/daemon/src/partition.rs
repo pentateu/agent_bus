@@ -26,6 +26,7 @@ use tokio::sync::broadcast;
 use ulid::Ulid;
 
 use crate::log::PartitionLog;
+use crate::metrics::PartitionTally;
 
 /// Capacity of the wake-up channel. Waiters re-scan the log on any signal, so a
 /// lagged receiver is harmless — it just means "check again".
@@ -72,6 +73,11 @@ pub struct Partition {
     /// is cosmetic, and persisting it would let a stale name outlive the
     /// process that chose it.
     labels: std::collections::BTreeMap<String, String>,
+    /// Cumulative per-partition counters for the dashboard. Bumped inside
+    /// `publish` / `deliver` / `prune`, which already run under the state lock.
+    // TODO(wiring): dead until the instrumentation tasks land; remove with them.
+    #[allow(dead_code)]
+    tally: PartitionTally,
     notify: broadcast::Sender<()>,
 }
 
@@ -103,8 +109,29 @@ impl Partition {
                          unread messages in {name} will be delivered again",
                         cursor_file.display()
                     );
+                    store
+                } else if let Some(triples) = CursorStore::legacy_triples(&raw) {
+                    // A legacy cursor file migrated into per-pattern positions.
+                    // Seed the per-label delivered set from the log so a label
+                    // that already consumed a message is not handed it again by
+                    // an overlapping pattern after the upgrade.
+                    eprintln!(
+                        "agent-bus: migrating legacy cursor file {} into per-pattern positions",
+                        cursor_file.display()
+                    );
+                    let mut store = store;
+                    for (subscriber, pattern, id) in triples {
+                        let Ok(pattern) = Pattern::parse(&pattern) else { continue };
+                        for message in log.messages() {
+                            if message.id <= id && pattern.matches(&message.topic) {
+                                store.mark_delivered(&subscriber, message.id);
+                            }
+                        }
+                    }
+                    store
+                } else {
+                    store
                 }
-                store
             }
             // A missing cursor file is the normal first-run state, not an
             // error: every pattern simply starts at "nothing consumed".
@@ -124,6 +151,7 @@ impl Partition {
             cursor_file,
             snapped: Vec::new(),
             labels: std::collections::BTreeMap::new(),
+            tally: PartitionTally::new(),
             notify,
         })
     }
@@ -131,6 +159,13 @@ impl Partition {
     #[must_use]
     pub fn name(&self) -> &str {
         self.name.as_str()
+    }
+
+    // TODO(wiring): dead until `build_metrics` lands; remove with it.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn tally(&self) -> &PartitionTally {
+        &self.tally
     }
 
     /// Receive a signal whenever a message is published here.
@@ -172,6 +207,12 @@ impl Partition {
     ///   copy — and only one copy, no matter how many patterns it reads that
     ///   happen to match.
     ///
+    /// The per-label delivered set closes the overlap the positions cannot:
+    /// if a label reads both `iot_base/dev_01` and `iot_base/*`, a message
+    /// matching both would otherwise be delivered twice to that label. Any
+    /// message id the label has already received is filtered out before the
+    /// pattern positions are consulted.
+    ///
     /// `limit` lets `wait` deliver at most one unit of work while `read` and
     /// `follow` drain everything currently unread. `history` is the only way to
     /// see a delivered message again.
@@ -189,18 +230,23 @@ impl Partition {
 
         // Merge the two streams in id order and take `limit`. Each stream is
         // already sorted, so this is a merge of two sorted lists rather than a
-        // full sort.
+        // full sort. Already-delivered ids are dropped first, so overlapping
+        // patterns cannot hand the same message to this label twice.
         let exclusive: Vec<Message> = self
             .log
             .messages_after(exclusive_cursor)
-            .filter(|m| !m.broadcast && pattern.matches(&m.topic))
+            .filter(|m| {
+                !m.broadcast && !self.cursors.is_delivered(label, m.id) && pattern.matches(&m.topic)
+            })
             .take(limit)
             .cloned()
             .collect();
         let broadcast: Vec<Message> = self
             .log
             .messages_after(broadcast_cursor)
-            .filter(|m| m.broadcast && pattern.matches(&m.topic))
+            .filter(|m| {
+                m.broadcast && !self.cursors.is_delivered(label, m.id) && pattern.matches(&m.topic)
+            })
             .take(limit)
             .cloned()
             .collect();
@@ -229,7 +275,9 @@ impl Partition {
         merged.extend(b_next.into_iter().chain(b));
         merged.truncate(limit);
 
-        // Advance each position to the last delivered message of its kind.
+        // Advance each position to the last delivered message of its kind, and
+        // record every delivered id against the label so no overlapping pattern
+        // can deliver the same message again.
         if let Some(last) = merged.iter().rev().find(|m| !m.broadcast) {
             self.cursors.advance_exclusive(pattern.as_str(), last.id);
         }
@@ -237,6 +285,9 @@ impl Partition {
             self.cursors.advance_broadcast(label, last.id);
         }
         if !merged.is_empty() {
+            for message in &merged {
+                self.cursors.mark_delivered(label, message.id);
+            }
             self.persist_cursors()?;
         }
         self.labels.insert(pattern.as_str().to_owned(), label.to_owned());
@@ -268,14 +319,15 @@ impl Partition {
             // reporting `snapped: true` in `status` makes the gap visible
             // rather than papering over it with a partial replay.
             let snapped = self.cursors.snap_forward(oldest);
-            if !snapped.is_empty() {
-                for key in snapped {
-                    if !self.snapped.contains(&key) {
-                        self.snapped.push(key);
-                    }
+            for key in snapped {
+                if !self.snapped.contains(&key) {
+                    self.snapped.push(key);
                 }
-                self.persist_cursors()?;
             }
+            // Delivered records for pruned messages are pure memory; drop them
+            // so the per-label sets do not grow without bound.
+            self.cursors.prune_delivered(oldest);
+            self.persist_cursors()?;
         }
         Ok(outcome.removed)
     }
@@ -502,12 +554,9 @@ mod tests {
             let mut p = partition(&dir);
             p.publish(msg("iot_base/dev_01", "one")).unwrap();
         }
-        // The pre-exclusive-delivery nested format, which no longer parses.
-        std::fs::write(
-            cursor_path(dir.path(), &name),
-            r#"{"reviewer":{"iot_base/**":"01J000000000000000000000"}}"#,
-        )
-        .unwrap();
+        // Torn, unparseable content: neither the current shape nor any legacy
+        // format. This must reset, not fail the open.
+        std::fs::write(cursor_path(dir.path(), &name), "{ this is not json").unwrap();
 
         // Unwrapped rather than `expect`ed: an `Err` here *is* the regression
         // (a bad cursor file failing the open), and the panic reports it.
@@ -516,6 +565,50 @@ mod tests {
             p.deliver(&Pattern::parse("iot_base/**").unwrap(), "r", usize::MAX).unwrap().len(),
             1,
             "positions are lost, so the retained log is redelivered rather than dropped"
+        );
+    }
+
+    /// A legacy nested cursor file must migrate, not reset: an upgrade must not
+    /// re-deliver messages the old daemon had already consumed.
+    #[test]
+    fn a_legacy_cursor_file_migrates_instead_of_resetting() {
+        let dir = TempDir::new().unwrap();
+        let name = PartitionName::parse("iot_base").unwrap();
+        {
+            let mut p = partition(&dir);
+            let m = msg("iot_base/dev_01", "one");
+            p.publish(m.clone()).unwrap();
+            // Consume it so its id becomes the cursor position.
+            p.deliver(&Pattern::parse("iot_base/dev_01").unwrap(), "dev", usize::MAX).unwrap();
+            // Now rewrite the file in the legacy nested shape, pointing at the
+            // same consumed id, as an old daemon would have left it.
+            let consumed = p
+                .pattern_snapshots()
+                .iter()
+                .find(|s| s.key == "iot_base/dev_01")
+                .map(|s| s.cursor.clone())
+                .unwrap();
+            std::fs::write(
+                cursor_path(dir.path(), &name),
+                format!(r#"{{"dev":{{"iot_base/dev_01":"{consumed}"}}}}"#),
+            )
+            .unwrap();
+        }
+
+        let mut p = Partition::open(dir.path(), &name).unwrap();
+        assert!(
+            p.deliver(&Pattern::parse("iot_base/dev_01").unwrap(), "dev", usize::MAX)
+                .unwrap()
+                .is_empty(),
+            "a legacy cursor file must keep the message consumed, not re-deliver it"
+        );
+        // And the delivered set must be seeded from the legacy file, so an
+        // overlapping pattern cannot hand the message back to the same label.
+        assert!(
+            p.deliver(&Pattern::parse("iot_base/*").unwrap(), "dev", usize::MAX)
+                .unwrap()
+                .is_empty(),
+            "legacy migration must seed the delivered set for overlapping patterns"
         );
     }
 
@@ -581,5 +674,68 @@ mod tests {
         // Second label: only the broadcast is left (exclusive messages are gone).
         let rest = p.deliver(&pattern, "r2", usize::MAX).unwrap();
         assert_eq!(rest.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["bcast"]);
+    }
+
+    /// Regression: the same message matches both `iot_base/dev_01` and
+    /// `iot_base/*`. One consumer must not receive it twice just because two of
+    /// its patterns select the same message — the wait on the exact inbox and
+    /// the hook on the wildcard are the same agent.
+    #[test]
+    fn overlapping_patterns_deliver_the_message_once_per_label() {
+        let dir = TempDir::new().unwrap();
+        let mut p = partition(&dir);
+        p.publish(msg("iot_base/dev_01", "verdict")).unwrap();
+
+        let exact = Pattern::parse("iot_base/dev_01").unwrap();
+        let wildcard = Pattern::parse("iot_base/*").unwrap();
+
+        // The agent's wait consumes it via the exact inbox...
+        assert_eq!(p.deliver(&exact, "dev", usize::MAX).unwrap().len(), 1);
+
+        // ...so the agent's own hook on the wildcard must NOT see it again.
+        assert!(
+            p.deliver(&wildcard, "dev", usize::MAX).unwrap().is_empty(),
+            "one message must be delivered once per label, even under overlapping patterns"
+        );
+
+        // But a genuinely different label still sees it via the wildcard: the
+        // exclusivity is per label, not global.
+        assert_eq!(p.deliver(&wildcard, "opencode-hook", usize::MAX).unwrap().len(), 1);
+    }
+
+    /// Regression, same root cause, other order: the wildcard hook wins the
+    /// race and the exact-inbox wait must not then re-deliver the message.
+    #[test]
+    fn overlapping_patterns_deliver_the_message_once_per_label_other_order() {
+        let dir = TempDir::new().unwrap();
+        let mut p = partition(&dir);
+        p.publish(msg("iot_base/dev_01", "verdict")).unwrap();
+
+        let exact = Pattern::parse("iot_base/dev_01").unwrap();
+        let wildcard = Pattern::parse("iot_base/*").unwrap();
+
+        assert_eq!(p.deliver(&wildcard, "dev", usize::MAX).unwrap().len(), 1);
+        assert!(
+            p.deliver(&exact, "dev", usize::MAX).unwrap().is_empty(),
+            "the exact inbox must not re-deliver what the wildcard already handed to the same label"
+        );
+    }
+
+    /// The per-label delivered-set must survive a reopen, or the fix would be
+    /// lost on every daemon restart — the exact symptom reported in the field.
+    #[test]
+    fn delivered_once_per_label_survives_a_reopen() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut p = partition(&dir);
+            p.publish(msg("iot_base/dev_01", "verdict")).unwrap();
+            p.deliver(&Pattern::parse("iot_base/dev_01").unwrap(), "dev", usize::MAX).unwrap();
+        }
+        let mut p = partition(&dir);
+        let wildcard = Pattern::parse("iot_base/*").unwrap();
+        assert!(
+            p.deliver(&wildcard, "dev", usize::MAX).unwrap().is_empty(),
+            "a restarted daemon must remember that this label already received the message"
+        );
     }
 }

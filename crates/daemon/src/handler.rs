@@ -130,6 +130,10 @@ pub fn dispatch(state: &mut BusState, request: Request) -> Dispatch {
 
         Request::Status => Dispatch::Reply(Response::Status { status: build_status(state) }),
 
+        Request::Metrics => {
+            Dispatch::Reply(Response::Error { message: "metrics not wired yet".to_owned() })
+        }
+
         Request::Stop => Dispatch::Shutdown,
     }
 }

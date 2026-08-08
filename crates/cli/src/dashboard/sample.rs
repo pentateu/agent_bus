@@ -24,17 +24,25 @@ pub fn bin_index(boundaries: &[u64], value: u64) -> usize {
 /// One poll's worth of derived numbers, suitable for appending to a series.
 #[allow(dead_code)] // wired into `app` in Task 6; remove the allow with it.
 pub struct Diff {
-    pub posts_per_sec: f64,
-    pub deliveries_per_sec: f64,
-    pub bytes_per_sec: f64,
+    /// Raw counts for THIS interval — the minute buckets accumulate these,
+    /// never the rates (an average of averages would skew).
+    pub posts_delta: u64,
+    pub deliveries_delta: u64,
+    pub bytes_delta: u64,
     /// Latency histogram for THIS interval only (delta of the cumulative).
     pub latency_delta: Vec<u64>,
     pub size_delta: Vec<u64>,
+    /// Midpoint-weighted sums for this interval, ms / bytes. The app divides
+    /// by its own running sample count for the minute's averages.
+    pub latency_sum_ms: u64,
+    pub size_sum_bytes: u64,
     /// p95 of this interval, in ms (the bucket's lower bound — good enough for
     /// a sparkline; the UI rounds to the bucket label).
     pub p95_latency_ms: u64,
-    pub avg_latency_ms: u64,
-    pub avg_size_bytes: u64,
+    /// Rates over the elapsed interval, for the UI's current-rate readouts.
+    pub posts_per_sec: f64,
+    pub deliveries_per_sec: f64,
+    pub bytes_per_sec: f64,
 }
 
 /// Counts per second, as an `f64`.
@@ -73,11 +81,7 @@ impl Sample {
             .collect();
 
         let total_lat_samples: u64 = latency_delta.iter().sum();
-        // `checked_div`: 0 samples means this interval saw no delivery, and a
-        // divide by zero would silently produce a bogus 0ms average.
-        let avg_latency_ms = weighted_mid(&latency_delta, &cur.latency_buckets_ms)
-            .checked_div(total_lat_samples)
-            .unwrap_or(0);
+        let latency_sum_ms = weighted_mid(&latency_delta, &cur.latency_buckets_ms);
         let p95_latency_ms = if total_lat_samples == 0 {
             0
         } else {
@@ -90,29 +94,23 @@ impl Sample {
                 .unwrap_or_else(|| cur.latency_buckets_ms.last().copied().unwrap_or(0))
         };
 
-        let total_size_samples: u64 = size_delta.iter().sum();
-        let avg_size_bytes = weighted_mid(&size_delta, &cur.size_buckets_bytes)
-            .checked_div(total_size_samples)
-            .unwrap_or(0);
+        let size_sum_bytes = weighted_mid(&size_delta, &cur.size_buckets_bytes);
+        let posts_delta = cur.totals.posts.saturating_sub(prev.totals.posts);
+        let deliveries_delta = cur.totals.deliveries.saturating_sub(prev.totals.deliveries);
+        let bytes_delta = cur.totals.bytes_posted.saturating_sub(prev.totals.bytes_posted);
 
         Some(Diff {
-            posts_per_sec: per_second(
-                cur.totals.posts.saturating_sub(prev.totals.posts),
-                elapsed_secs,
-            ),
-            deliveries_per_sec: per_second(
-                cur.totals.deliveries.saturating_sub(prev.totals.deliveries),
-                elapsed_secs,
-            ),
-            bytes_per_sec: per_second(
-                cur.totals.bytes_posted.saturating_sub(prev.totals.bytes_posted),
-                elapsed_secs,
-            ),
+            posts_delta,
+            deliveries_delta,
+            bytes_delta,
             latency_delta,
             size_delta,
+            latency_sum_ms,
+            size_sum_bytes,
             p95_latency_ms,
-            avg_latency_ms,
-            avg_size_bytes,
+            posts_per_sec: per_second(posts_delta, elapsed_secs),
+            deliveries_per_sec: per_second(deliveries_delta, elapsed_secs),
+            bytes_per_sec: per_second(bytes_delta, elapsed_secs),
         })
     }
 }

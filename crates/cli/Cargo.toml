@@ -14,7 +14,9 @@ agent-bus-core = { workspace = true }
 agent-bus-protocol = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+crossterm = "0.28"
 humantime = { workspace = true }
+ratatui = { version = "0.29", features = ["crossterm"] }
 serde_json = { workspace = true }
 
 # `serde_json` is already a normal dependency and is therefore in scope for

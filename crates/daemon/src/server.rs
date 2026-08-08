@@ -2,6 +2,8 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use agent_bus_core::{IDLE_SHUTDOWN_SECS, PartitionName, Pattern};
 use agent_bus_protocol::{Request, Response, encode};
 use anyhow::{Context, Result};
@@ -50,6 +52,12 @@ pub async fn serve(socket: &Path, state: Arc<Mutex<BusState>>) -> Result<()> {
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(4);
     tokio::spawn(crate::sweep::run(Arc::clone(&state), shutdown_tx.clone()));
 
+    // Parked connections (wait/follow) live outside the state mutex, so their
+    // counts cannot live in `BusState`; these atomics are bumped on entry to
+    // the parked loop and decremented on exit by the RAII guards.
+    let active_waiters = Arc::new(AtomicU64::new(0));
+    let active_followers = Arc::new(AtomicU64::new(0));
+
     // Built once, outside the loop. `ctrl_c()` returns a fresh future each call,
     // and a `select!` arm that rebuilds it every iteration re-registers the
     // handler on each pass; pinning one future keeps a single registration and
@@ -65,9 +73,11 @@ pub async fn serve(socket: &Path, state: Arc<Mutex<BusState>>) -> Result<()> {
                         let state = Arc::clone(&state);
                         let shutdown = shutdown_tx.clone();
                         let socket_path = socket.to_path_buf();
+                        let aw = Arc::clone(&active_waiters);
+                        let af = Arc::clone(&active_followers);
                         tokio::spawn(async move {
                             if let Err(e) =
-                                handle_connection(stream, state, shutdown, socket_path).await
+                                handle_connection(stream, state, shutdown, socket_path, aw, af).await
                             {
                                 eprintln!("agent-bus: connection error: {e:#}");
                             }
@@ -92,6 +102,8 @@ async fn handle_connection(
     state: Arc<Mutex<BusState>>,
     shutdown: mpsc::Sender<()>,
     socket_path: std::path::PathBuf,
+    active_waiters: Arc<AtomicU64>,
+    active_followers: Arc<AtomicU64>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
@@ -138,8 +150,15 @@ async fn handle_connection(
                 let timeout = Duration::from_secs(
                     timeout_secs.unwrap_or(DEFAULT_WAIT_TIMEOUT_SECS).min(MAX_WAIT_TIMEOUT_SECS),
                 );
-                let response =
-                    wait_for_message(&state, &partition, &pattern, &label, timeout).await;
+                let response = wait_for_message(
+                    &state,
+                    &partition,
+                    &pattern,
+                    &label,
+                    timeout,
+                    Arc::clone(&active_waiters),
+                )
+                .await;
                 send(&mut write_half, &response).await?;
             }
 
@@ -149,7 +168,15 @@ async fn handle_connection(
                 // previously the error propagated out of here to the daemon's
                 // stderr, which is /dev/null for an auto-started daemon, and
                 // the client saw a bare EOF and reported success.
-                if let Err(e) = follow(&state, &partition, &pattern, &label, &mut write_half).await
+                if let Err(e) = follow(
+                    &state,
+                    &partition,
+                    &pattern,
+                    &label,
+                    &mut write_half,
+                    Arc::clone(&active_followers),
+                )
+                .await
                 {
                     let response = Response::Error { message: format!("follow failed: {e:#}") };
                     // Best-effort: if the write also fails the client is
@@ -163,6 +190,29 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+/// RAII guard that bumps a counter on creation and decrements it on drop.
+///
+/// The parked loops in `wait` and `follow` have many return paths (messages,
+/// timeout, partition errors, client disconnect), and forgetting one would
+/// leave a phantom "active" connection. A `Drop` guard makes the decrement
+/// unconditional, the same way a lock guard does.
+struct ActiveGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl ActiveGuard {
+    fn new(counter: Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Block until a matching unread message exists, or the timeout expires.
@@ -179,7 +229,10 @@ async fn wait_for_message(
     pattern: &Pattern,
     label: &str,
     timeout: Duration,
+    active_waiters: Arc<AtomicU64>,
 ) -> Response {
+    let _waiter_guard = ActiveGuard::new(active_waiters);
+
     let name = match PartitionName::parse(partition) {
         Ok(n) => n,
         Err(e) => return Response::Error { message: e.to_string() },
@@ -248,7 +301,10 @@ async fn follow(
     pattern: &Pattern,
     label: &str,
     write_half: &mut OwnedWriteHalf,
+    active_followers: Arc<AtomicU64>,
 ) -> Result<()> {
+    let _follower_guard = ActiveGuard::new(active_followers);
+
     let name = PartitionName::parse(partition)?;
     let mut notifications = {
         let mut guard = state.lock().await;
@@ -327,9 +383,15 @@ mod tests {
             .publish(msg("iot_base/dev_01", "hi"))
             .unwrap();
 
-        let response =
-            wait_for_message(&state, "iot_base", &pattern(), "reviewer", Duration::from_secs(30))
-                .await;
+        let response = wait_for_message(
+            &state,
+            "iot_base",
+            &pattern(),
+            "reviewer",
+            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
 
         match response {
             Response::Messages { messages } => {
@@ -354,12 +416,25 @@ mod tests {
             .publish(msg("iot_base/dev_01", "hi"))
             .unwrap();
 
-        let _ =
-            wait_for_message(&state, "iot_base", &pattern(), "reviewer", Duration::from_secs(30))
-                .await;
+        let _ = wait_for_message(
+            &state,
+            "iot_base",
+            &pattern(),
+            "reviewer",
+            Duration::from_secs(30),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
 
-        let response =
-            wait_for_message(&state, "iot_base", &pattern(), "other", Duration::ZERO).await;
+        let response = wait_for_message(
+            &state,
+            "iot_base",
+            &pattern(),
+            "other",
+            Duration::ZERO,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
         assert!(
             matches!(response, Response::Timeout),
             "the delivered message must not be handed to any second consumer"
@@ -371,8 +446,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let state = state(&dir);
 
-        let response =
-            wait_for_message(&state, "iot_base", &pattern(), "reviewer", Duration::ZERO).await;
+        let response = wait_for_message(
+            &state,
+            "iot_base",
+            &pattern(),
+            "reviewer",
+            Duration::ZERO,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
 
         assert!(matches!(response, Response::Timeout), "an empty log must time out, not hang");
     }
@@ -401,6 +483,7 @@ mod tests {
                     &Pattern::parse("iot_base/**").unwrap(),
                     "reviewer",
                     Duration::from_secs(30),
+                    Arc::new(AtomicU64::new(0)),
                 )
                 .await
             })

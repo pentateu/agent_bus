@@ -18,7 +18,7 @@ use std::{
 };
 
 use agent_bus_core::{
-    CursorStore, Message, PartitionName, Pattern, RetentionPolicy,
+    CursorStore, Message, PartitionName, Pattern, Priority, RetentionPolicy,
     paths::{cursor_path, log_path},
 };
 use anyhow::{Context, Result};
@@ -182,6 +182,8 @@ impl Partition {
     #[allow(clippy::needless_pass_by_value)]
     pub fn publish(&mut self, message: Message) -> Result<Ulid> {
         let id = message.id;
+        let body_bytes = u64::try_from(message.body.len()).unwrap_or(u64::MAX);
+        self.tally.record_post(body_bytes, message.priority == Priority::High, message.broadcast);
         self.log.append(&message)?;
         // Signalled only after the append succeeded, so a woken waiter always
         // finds the message on its re-scan. An error here only means nobody is
@@ -291,6 +293,8 @@ impl Partition {
             self.persist_cursors()?;
         }
         self.labels.insert(pattern.as_str().to_owned(), label.to_owned());
+        let delivered = u64::try_from(merged.len()).unwrap_or(u64::MAX);
+        self.tally.record_deliveries(delivered);
         Ok(merged)
     }
 
@@ -307,6 +311,7 @@ impl Partition {
     #[allow(clippy::trivially_copy_pass_by_ref)] // Matches `PartitionLog::prune`.
     pub fn prune(&mut self, policy: &RetentionPolicy, now: u64) -> Result<usize> {
         let outcome = self.log.prune(policy, now)?;
+        let mut snapped_count: u64 = 0;
         if outcome.removed > 0
             && let Some(oldest) = outcome.oldest_surviving
         {
@@ -318,8 +323,9 @@ impl Partition {
             // not something one extra message repairs. Losing them and
             // reporting `snapped: true` in `status` makes the gap visible
             // rather than papering over it with a partial replay.
-            let snapped = self.cursors.snap_forward(oldest);
-            for key in snapped {
+            let snapped_keys = self.cursors.snap_forward(oldest);
+            snapped_count = u64::try_from(snapped_keys.len()).unwrap_or(u64::MAX);
+            for key in snapped_keys {
                 if !self.snapped.contains(&key) {
                     self.snapped.push(key);
                 }
@@ -329,6 +335,7 @@ impl Partition {
             self.cursors.prune_delivered(oldest);
             self.persist_cursors()?;
         }
+        self.tally.record_prune(u64::try_from(outcome.removed).unwrap_or(u64::MAX), snapped_count);
         Ok(outcome.removed)
     }
 
@@ -737,5 +744,61 @@ mod tests {
             p.deliver(&wildcard, "dev", usize::MAX).unwrap().is_empty(),
             "a restarted daemon must remember that this label already received the message"
         );
+    }
+
+    #[test]
+    fn publish_increments_partition_tally() {
+        let dir = TempDir::new().unwrap();
+        let mut p = partition(&dir);
+        p.publish(msg("iot_base/dev_01", "x")).unwrap();
+        p.publish(msg("iot_base/dev_01", "y")).unwrap();
+        assert_eq!(p.tally().posts, 2);
+        assert_eq!(p.tally().bytes, 2);
+        assert_eq!(p.tally().deliveries, 0);
+    }
+
+    #[test]
+    fn deliver_increments_delivery_count() {
+        let dir = TempDir::new().unwrap();
+        let mut p = partition(&dir);
+        p.publish(msg("iot_base/dev_01", "a")).unwrap();
+        p.publish(msg("iot_base/dev_01", "b")).unwrap();
+        let pattern = Pattern::parse("iot_base/**").unwrap();
+        p.deliver(&pattern, "r", usize::MAX).unwrap();
+        assert_eq!(p.tally().deliveries, 2);
+        // A second deliver finds nothing, so it must not bump again.
+        p.deliver(&pattern, "r", usize::MAX).unwrap();
+        assert_eq!(p.tally().deliveries, 2);
+    }
+
+    #[test]
+    fn prune_records_removed_and_snapped_into_tally() {
+        // Real-time ULIDs are all born in the same second, so a retention
+        // window that removes "old" would also remove "fresh". Craft the ids
+        // with explicit, well-separated timestamps so the ages are controlled.
+        fn msg_at(topic: &str, body: &str, ms: u64) -> Message {
+            let mut m = msg(topic, body);
+            m.id = Ulid::from_parts(ms, 0);
+            m
+        }
+        let dir = TempDir::new().unwrap();
+        let mut p = partition(&dir);
+        let old = msg_at("iot_base/dev_01", "old", 2_000);
+        p.publish(old).unwrap();
+        let middle = msg_at("iot_base/dev_01", "middle", 3_000);
+        p.publish(middle).unwrap();
+        let fresh = msg_at("iot_base/dev_01", "fresh", 4_000);
+        p.publish(fresh).unwrap();
+
+        // Put a stale cursor in place so snap_forward fires: the cursor points
+        // at `old`, which sits inside the pruned range.
+        let pattern = Pattern::parse("iot_base/**").unwrap();
+        p.deliver(&pattern, "r", 1).unwrap(); // consumes "old", sets cursor
+        // 1s retention at `now` (4s) removes `old` (age 2) and `middle` (age 1)
+        // but retains `fresh` (age 0), so `oldest_surviving` exists for the snap.
+        p.prune(&RetentionPolicy { max_age_secs: 1 }, 4).unwrap();
+        assert_eq!(p.tally().pruned, 2);
+        // The cursor pointed at `old`, which is pruned, so it gets snapped.
+        assert_eq!(p.tally().snapped, 1);
     }
 }

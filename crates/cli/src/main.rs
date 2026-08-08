@@ -5,6 +5,7 @@
 mod cli;
 mod client;
 mod commands;
+mod dashboard;
 mod guide;
 mod output;
 

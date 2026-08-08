@@ -587,6 +587,63 @@ fn exclusive_and_broadcast_messages_coexist() {
     stop(state);
 }
 
+/// Regression: an agent whose hook watches a wildcard (`iot_platform/*`) and
+/// whose wait reads an exact inbox (`iot_platform/dev`) must not receive the
+/// same message twice. Both patterns select a verdict posted to the inbox, so
+/// without a per-label delivered set the hook and the wait each deliver it.
+#[test]
+fn overlapping_patterns_do_not_double_deliver_to_one_agent() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path();
+
+    bus(state, &["post", "iot_base/dev_01", "verdict: APPROVE"]);
+
+    // The agent's exact-inbox wait takes it.
+    let wait = bus(state, &["read", "iot_base/dev_01", "--as", "dev", "--json"]);
+    assert_eq!(bodies(&wait), vec!["verdict: APPROVE"]);
+
+    // The agent's wildcard hook must NOT see it again.
+    let hook = bus(state, &["read", "iot_base/*", "--as", "dev", "--json"]);
+    assert!(
+        bodies(&hook).is_empty(),
+        "overlapping patterns must not deliver the same message twice to one label"
+    );
+
+    // A genuinely different consumer still sees it via the wildcard: delivery
+    // is exclusive per label, not global.
+    let other = bus(state, &["read", "iot_base/*", "--as", "opencode-hook", "--json"]);
+    assert_eq!(bodies(&other), vec!["verdict: APPROVE"]);
+
+    stop(state);
+}
+
+/// Regression: the fix must survive a daemon restart. The exact symptom from
+/// the field was "I restarted the daemon and wait replayed already-consumed
+/// messages" — caused both by the pre-change cursor format being wiped and by
+/// the delivered set (once it exists) not being persisted.
+#[test]
+fn no_duplicate_delivery_after_a_daemon_restart() {
+    let dir = TempDir::new().unwrap();
+    let state = dir.path().to_path_buf();
+
+    bus(&state, &["post", "iot_base/dev_01", "verdict: BLOCK"]);
+    bus(&state, &["read", "iot_base/dev_01", "--as", "dev", "--json"]);
+    stop(&state);
+
+    // Next command auto-starts a fresh daemon.
+    let after = bus(&state, &["read", "iot_base/dev_01", "--as", "dev", "--json"]);
+    assert!(bodies(&after).is_empty(), "a restarted daemon must not re-deliver a consumed message");
+
+    // And the wildcard hook still must not re-deliver it either.
+    let hook = bus(&state, &["read", "iot_base/*", "--as", "dev", "--json"]);
+    assert!(
+        bodies(&hook).is_empty(),
+        "the delivered set must survive a restart across overlapping patterns"
+    );
+
+    stop(&state);
+}
+
 #[test]
 fn invalid_input_exits_one() {
     let dir = TempDir::new().unwrap();

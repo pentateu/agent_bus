@@ -90,7 +90,11 @@ so a label that already received it never receives it again. See POSTING below.
 Because positions belong to the pattern (or, for broadcast, the label), reading
 one pattern never consumes another's messages: waiting on `iot_base/dev_01`
 leaves anything on `iot_base/planner` untouched and unread. Each pattern has
-its own position.
+its own position. And delivery is per label, not per pattern-count: if the same
+agent reads both `iot_base/dev_01` and `iot_base/*`, the bus remembers the
+message ids it has already received, so a message matching both patterns is
+delivered to that label exactly once — the wait on the inbox and the hook on
+the wildcard do not each get their own copy.
 
 Your label defaults to the pattern you subscribe with, so this:
 
@@ -102,6 +106,12 @@ different labels does NOT give each consumer its own copy. Two agents that read
 with the same pattern share one position and compete for each message, exactly
 once each. If two agents must each see the same message, give each its own
 pattern (its own inbox), not its own label.
+
+The bus also remembers, per label, every message id it has already delivered.
+That is what makes an exact inbox (`iot_base/dev_01`) and an overlapping
+wildcard (`iot_base/*`) safe to use together: whichever reads a message first,
+the other will not receive it again, because the label has already seen that
+id.
 
 The only way to see a delivered message again is `history`, which ignores
 positions entirely and replays whatever is still retained.

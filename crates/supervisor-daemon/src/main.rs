@@ -61,6 +61,13 @@ async fn run() -> Result<()> {
         .server_password;
     let token = load_or_create_token(&token_path(&state_dir)).context("loading API token")?;
 
+    // Record our PID so `supervisor stop` can signal the daemon properly
+    // (no pgrep, no guessing — the CLI reads this file).
+    if let Err(e) = std::fs::write(state_dir.join("supervisor.pid"), std::process::id().to_string())
+    {
+        tracing::warn!(error = %e, "cannot write supervisor.pid");
+    }
+
     // 2. Ensure default graphs are installed.
     ensure_default_graphs(&fleet).await?;
 
@@ -77,6 +84,11 @@ async fn run() -> Result<()> {
         Arc::new(ManagerClient::connect(config.supervisor.supervisor_workspace_port, &secret)?);
     let drivers = Arc::new(DriverRegistry::new(Arc::clone(&fleet), secret.clone()));
     let shutdown = supervisor_daemon::services::workspace::cancellation();
+    // Install SIGINT/SIGTERM handling up front. If a signal arrives during
+    // startup (before the API binds), the handler here still cancels the
+    // token; without it the default disposition kills the daemon mid-resume
+    // and whatever server it was spawning orphans.
+    tokio::spawn(shutdown_guard(shutdown.clone()));
 
     let workspaces = Arc::new(WorkspaceManager::new(ManagerDeps {
         fleet: Arc::clone(&fleet),
@@ -260,8 +272,12 @@ async fn run() -> Result<()> {
     // SSE streams (/api/v1/events) never close on their own, so axum's
     // graceful shutdown alone would wait forever on an open browser tab and
     // the daemon would never actually stop.
-    let serve_fut = axum::serve(listener, router(&app_state))
-        .with_graceful_shutdown(shutdown_guard(shutdown.clone()));
+    let serve_fut = axum::serve(listener, router(&app_state)).with_graceful_shutdown({
+        // The token is cancelled by the up-front shutdown_guard task (SIGINT/
+        // SIGTERM, installed before startup completes).
+        let shutdown = shutdown.clone();
+        async move { shutdown.cancelled().await }
+    });
     let drain = {
         let shutdown = shutdown.clone();
         async move {

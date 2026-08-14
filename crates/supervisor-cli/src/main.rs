@@ -7,7 +7,7 @@
 
 use std::process::ExitCode;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 
 use crate::client::{ApiClient, ClientConfig};
@@ -43,6 +43,8 @@ pub enum Command {
     },
     /// Restore all on-marked workspaces (serial).
     Resume,
+    /// Gracefully stop the daemon (SIGTERM, wait for exit, report).
+    Stop,
     /// Start a workflow graph for a workspace (bringing it on if off).
     Start {
         ws: String,
@@ -171,6 +173,7 @@ fn run(cli: &Cli) -> Result<()> {
         Command::On { project } => on(cli, project),
         Command::Off { project, force } => off(cli, project, *force),
         Command::Resume => resume(cli),
+        Command::Stop => stop(cli),
         Command::Start { ws, graph, vars } => start(cli, ws, graph, vars),
         Command::Smoke { ws, graph, timeout } => smoke(cli, ws, graph, *timeout),
         Command::Log { tail, json } => log(cli, *tail, *json),
@@ -248,6 +251,65 @@ fn resume(cli: &Cli) -> Result<()> {
     let result = client.resume()?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+/// Gracefully stop the daemon: read its PID file, send SIGTERM, wait for the
+/// process to exit, and report. No pgrep, no guessing — the daemon writes
+/// `~/.supervisor/supervisor.pid` on start.
+fn stop(cli: &Cli) -> Result<()> {
+    let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
+    let pid_path = state_dir.join("supervisor.pid");
+    let pid: u32 = std::fs::read_to_string(&pid_path)
+        .with_context(|| format!("daemon not running (no pid file at {})", pid_path.display()))?
+        .trim()
+        .parse()
+        .context("corrupt supervisor.pid")?;
+
+    // Is the recorded process actually a live supervisor-daemon?
+    let alive = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !alive {
+        anyhow::bail!("daemon not running (pid {pid} is gone; stale pid file)");
+    }
+
+    println!("stopping supervisor daemon (pid {pid})…");
+    let sent = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .context("cannot send SIGTERM")?;
+    if !sent.success() {
+        anyhow::bail!("failed to signal the daemon");
+    }
+
+    // Wait for the graceful shutdown (drain window + children close) to
+    // finish. Poll `kill -0` — the daemon exits 0 once cleanup completes.
+    // 60s headroom: a stop that arrives during a slow startup (health wait)
+    // only reaches the shutdown path after startup completes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+    loop {
+        let still_alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !still_alive {
+            println!("supervisor daemon stopped (pid {pid})");
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("daemon did not stop within 30s (check ~/.supervisor/daemon.log)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// The default state dir, mirroring the daemon's `~/.supervisor`.
+fn default_state_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+    std::path::PathBuf::from(home).join(".supervisor")
 }
 
 /// Parse a `key=value` workflow variable (F3).

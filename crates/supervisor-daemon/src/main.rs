@@ -255,10 +255,27 @@ async fn run() -> Result<()> {
         .await
         .with_context(|| format!("binding API on {}", config.supervisor.api_port))?;
     tracing::info!(port = config.supervisor.api_port, "supervisor API listening");
-    let result = axum::serve(listener, router(&app_state))
-        .with_graceful_shutdown(shutdown_guard(shutdown.clone()))
-        .await
-        .context("API server exited unexpectedly");
+    // Serve until SIGINT/SIGTERM, then give in-flight connections a short
+    // drain window before proceeding to cleanup. A hard grace is required:
+    // SSE streams (/api/v1/events) never close on their own, so axum's
+    // graceful shutdown alone would wait forever on an open browser tab and
+    // the daemon would never actually stop.
+    let serve_fut = axum::serve(listener, router(&app_state))
+        .with_graceful_shutdown(shutdown_guard(shutdown.clone()));
+    let drain = {
+        let shutdown = shutdown.clone();
+        async move {
+            shutdown.cancelled().await;
+            tokio::time::sleep(SHUTDOWN_DRAIN_SECS).await;
+        }
+    };
+    let result = tokio::select! {
+        result = serve_fut => result.context("API server exited unexpectedly"),
+        () = drain => {
+            tracing::warn!("shutdown drain window elapsed with connections open; forcing stop");
+            Ok(())
+        }
+    };
     // Review finding 5: shutdown must close the per-workspace children (the
     // design's "close children" step), not just the supervisor workspace
     // server. Without this every `opencode serve` orphans on SIGTERM (adopt-
@@ -279,6 +296,10 @@ async fn run() -> Result<()> {
     }
     result
 }
+
+/// How long to wait for in-flight API connections to drain after a shutdown
+/// signal before forcing the stop (SSE streams never close on their own).
+const SHUTDOWN_DRAIN_SECS: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A future that completes on SIGINT or SIGTERM (the launchd/`kill -TERM`
 /// signal), then cancels the shutdown token. `tokio::signal::ctrl_c` alone

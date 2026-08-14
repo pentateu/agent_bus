@@ -4,6 +4,7 @@ use std::{
     fmt,
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -166,14 +167,38 @@ pub fn socket_path() -> PathBuf {
 /// startup and the losers exit silently, so at most one survives.
 fn spawn_daemon(socket: &Path) -> Result<()> {
     let exe = daemon_binary()?;
-    std::process::Command::new(&exe)
+    let mut command = std::process::Command::new(&exe);
+    command
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| {
-            format!("starting daemon {} (socket {})", exe.display(), socket.display())
-        })?;
+        // The daemon must not share the caller's process group: when a harness
+        // kills a tool call's process group (a `wait` that overran its tool
+        // timeout, a cancelled step), a daemon in that group dies with it, and
+        // the next command starts another one — the pid churn agents observed
+        // as a "crash loop". A private group leaves the daemon to outlive the
+        // tool call that spawned it, which is the whole point of a resident
+        // bus.
+        .process_group(0);
+
+    // Capture whatever the daemon writes to stdout/stderr — diagnostics this
+    // CLI has not routed into the daemon's own log — into that same log file,
+    // rather than /dev/null where it used to vanish. Opening the log is
+    // best-effort: if it fails, the previous /dev/null behaviour is the fallback.
+    match std::fs::OpenOptions::new().create(true).append(true).open(core_paths::daemon_log_path())
+    {
+        Ok(file) => {
+            let stdout = file
+                .try_clone()
+                .map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from);
+            command.stdout(stdout).stderr(std::process::Stdio::from(file));
+        }
+        Err(_) => {
+            command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        }
+    }
+
+    command.spawn().with_context(|| {
+        format!("starting daemon {} (socket {})", exe.display(), socket.display())
+    })?;
     Ok(())
 }
 

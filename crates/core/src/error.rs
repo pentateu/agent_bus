@@ -14,4 +14,7 @@ pub enum CoreError {
 
     #[error("malformed message record: {0}")]
     MalformedRecord(String),
+
+    #[error("invalid workflow {name:?}: {reason}")]
+    InvalidWorkflow { name: String, reason: String },
 }

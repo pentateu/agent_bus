@@ -102,21 +102,20 @@ impl Partition {
                 // right call for a file that is stale within the hour.
                 let (store, reason) = CursorStore::from_json_or_reset(&raw);
                 if let Some(reason) = reason {
-                    eprintln!(
-                        "agent-bus: ignoring unreadable cursor file {} ({reason}); \
-                         unread messages in {name} will be delivered again",
+                    crate::logging::log_msg(&format!(
+                        "ignoring unreadable cursor file {} ({reason}); unread messages in {name} will be delivered again",
                         cursor_file.display()
-                    );
+                    ));
                     store
                 } else if let Some(triples) = CursorStore::legacy_triples(&raw) {
                     // A legacy cursor file migrated into per-pattern positions.
                     // Seed the per-label delivered set from the log so a label
                     // that already consumed a message is not handed it again by
                     // an overlapping pattern after the upgrade.
-                    eprintln!(
-                        "agent-bus: migrating legacy cursor file {} into per-pattern positions",
+                    crate::logging::log_msg(&format!(
+                        "migrating legacy cursor file {} into per-pattern positions",
                         cursor_file.display()
-                    );
+                    ));
                     let mut store = store;
                     for (subscriber, pattern, id) in triples {
                         let Ok(pattern) = Pattern::parse(&pattern) else { continue };

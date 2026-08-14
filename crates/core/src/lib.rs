@@ -12,15 +12,23 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub mod cursor;
+pub mod dag;
 pub mod error;
 pub mod message;
 pub mod paths;
 pub mod retention;
+pub mod rules;
+pub mod state;
 pub mod topic;
 
 pub use cursor::CursorStore;
+pub use dag::{Decision, DoneWhen, NodeDef, NodeEvent, NodeState, OnError, Workflow};
 pub use error::CoreError;
-pub use message::{Message, Priority};
+pub use message::{Message, MessageKind, Priority, now_rfc3339};
 pub use paths::PartitionName;
-pub use retention::{IDLE_SHUTDOWN_SECS, RetentionPolicy};
+pub use retention::{
+    DEFAULT_WAIT_TIMEOUT_SECS, IDLE_SHUTDOWN_SECS, MAX_WAIT_TIMEOUT_SECS, RetentionPolicy,
+};
+pub use rules::{CodeRule, Evaluation, Rule, RuleAction, RuleContext, RuleEngine};
+pub use state::{AgentRecord, AgentState, Provenance, Signal, Transition, transition};
 pub use topic::{Pattern, Topic};

@@ -69,7 +69,7 @@ fn run(args: Cli) -> anyhow::Result<ExitCode> {
         Command::Wait { pattern, as_id, timeout } => {
             let subscriber = subscriber_id(as_id.as_deref(), &pattern);
             let timeout_secs = timeout.as_deref().map(parse_duration_secs).transpose()?;
-            commands::wait::run(&pattern, subscriber, timeout_secs, json)
+            commands::wait::run(&pattern, &subscriber, timeout_secs, json)
         }
 
         Command::Read { pattern, as_id } => {

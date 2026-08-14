@@ -6,6 +6,7 @@
 
 mod handler;
 mod log;
+mod logging;
 mod metrics;
 mod partition;
 mod server;
@@ -19,9 +20,15 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use tokio::sync::Mutex;
 
-use crate::state::BusState;
+use crate::{logging::log_msg, state::BusState};
 
 fn main() -> Result<()> {
+    // Before anything else: a panic on any thread must land in the log, and
+    // diagnostics must have a file to go to, or a crash leaves no trace.
+    logging::install_panic_hook();
+    logging::init();
+    log_msg(&format!("starting; log {}", logging::log_path().display()));
+
     let state_dir = state_dir_from_env();
     std::fs::create_dir_all(&state_dir)
         .with_context(|| format!("creating state directory {}", state_dir.display()))?;
@@ -39,6 +46,7 @@ fn main() -> Result<()> {
 
     if lock_file.try_lock_exclusive().is_err() {
         // Another daemon owns this state directory. Not an error.
+        log_msg("another daemon already owns the state directory; exiting");
         return Ok(());
     }
 
@@ -50,7 +58,12 @@ fn main() -> Result<()> {
     let socket = socket_path(&state_dir);
     let state = Arc::new(Mutex::new(BusState::new(state_dir)));
 
+    log_msg(&format!("serving on {}", socket.display()));
     let outcome = runtime.block_on(server::serve(&socket, state));
+    match &outcome {
+        Ok(()) => log_msg("exiting cleanly"),
+        Err(e) => log_msg(&format!("exiting with error: {e:#}")),
+    }
 
     // Unlocked on both paths, not just success: the OS would release it at exit
     // anyway, but an explicit call that only ran when things went well would be

@@ -75,6 +75,9 @@ pub enum Response {
     },
     Posted {
         id: String,
+        /// RFC 3339 timestamp of when the message was stamped on send, so a
+        /// publisher can report when its post went out without racing a clock.
+        ts: String,
     },
     Messages {
         messages: Vec<Message>,

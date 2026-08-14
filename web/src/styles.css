@@ -68,7 +68,7 @@ main { max-width: 1200px; margin: 0 auto; padding: 16px; }
 .metric-label { display: block; color: var(--dim); font-size: 11px; text-transform: uppercase; }
 .metric-value { font-size: 18px; font-weight: 700; }
 
-.ws-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; }
+.ws-grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
 .ws-card {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -90,10 +90,35 @@ main { max-width: 1200px; margin: 0 auto; padding: 16px; }
 .ws-agents { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
 .ws-triage { color: var(--amber); font-size: 12px; margin: 6px 0; }
 .ws-canvas { border: 1px solid var(--border); border-radius: 8px; margin-top: 10px; overflow: hidden; }
-.ws-canvas .canvas-title { display: block; padding: 4px 8px; font-size: 12px; color: var(--dim); }
+.ws-canvas .canvas-title { display: block; padding: 6px 10px; font-size: 13px; color: var(--dim); }
+
+/* One process at a time: workspace tabs between active graphs. */
+.graph-tabs { display: flex; gap: 6px; margin: 12px 0 2px; flex-wrap: wrap; }
+.graph-tab {
+  background: transparent;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 14px;
+  font-size: 12px;
+}
+.graph-tab:hover { background: #21262d; }
+.graph-tab.active { color: var(--text); background: #21262d; border-color: var(--blue); }
+
+/* react-flow zoom controls: visible icons on the dark theme. */
+.react-flow__controls { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45); }
+.react-flow__controls-button {
+  background: #21262d;
+  border: 1px solid var(--border);
+  color: var(--text);
+  width: 28px;
+  height: 28px;
+}
+.react-flow__controls-button svg { fill: currentColor; }
+.react-flow__controls-button:hover { background: #30363d; }
 
 /* --- WorkflowCanvas node card --- */
-.wf-canvas { height: 420px; }
+.wf-canvas { height: 520px; }
 .wf-canvas.wf-compact { height: 260px; }
 .wf-node {
   background: var(--panel);

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, parseGraph } from "../api/endpoints";
 import { useLive } from "../store/live-store";
@@ -28,7 +29,8 @@ function useGraphNodeStates(graphId: string): Record<string, NodeState> {
   }, {});
 }
 
-/** A mini live canvas for one installed graph (hook-safe child). */
+/** A live canvas for one installed graph (hook-safe child). Full-width, one
+ * per workspace at a time (the workspace card tabs between them). */
 function LiveGraph({ ws, graph, agents }: { ws: string; graph: GraphRecord; agents: Agent[] }) {
   const live = useLive();
   const nodeStates = useGraphNodeStates(graph.id);
@@ -45,7 +47,6 @@ function LiveGraph({ ws, graph, agents }: { ws: string; graph: GraphRecord; agen
       <WorkflowCanvas
         graph={parsed}
         mode="live"
-        compact
         nodeStates={nodeStates}
         agentStates={agentStates}
         onNodeClick={(n, agent) => {
@@ -59,6 +60,7 @@ function LiveGraph({ ws, graph, agents }: { ws: string; graph: GraphRecord; agen
 
 function WorkspaceCard({ ws }: { ws: string }) {
   const live = useLive();
+  const [activeGraph, setActiveGraph] = useState<string | null>(null);
   const { data: agents } = useQuery({
     queryKey: ["agents", ws],
     queryFn: () => api.agents(ws),
@@ -67,6 +69,9 @@ function WorkspaceCard({ ws }: { ws: string }) {
   const { data: graphs } = useQuery({ queryKey: ["graphs"], queryFn: api.graphs });
   const agentList = agents ?? [];
   const running = (graphs ?? []).filter((g) => g.active);
+  // One process at a time: tabs when several are active, defaulting to the
+  // first. If the selected graph vanishes, fall back to the first active one.
+  const current = running.find((g) => g.id === activeGraph) ?? running[0];
   const state = live.workspaceStates[ws] ?? "off";
   const triage = agentList.filter((a) => a.state === "waiting_input" || a.state === "blocked_permission");
 
@@ -89,9 +94,23 @@ function WorkspaceCard({ ws }: { ws: string }) {
         {agentList.length === 0 && <span className="dim">no agents configured</span>}
       </div>
       {triage.length > 0 && <div className="ws-triage">⚠ {triage.length} awaiting input/approval</div>}
-      {running.map((g) => (
-        <LiveGraph key={g.id} ws={ws} graph={g} agents={agentList} />
-      ))}
+      {running.length > 1 && (
+        <div className="graph-tabs" role="tablist" aria-label={`${ws} workflows`}>
+          {running.map((g) => (
+            <button
+              key={g.id}
+              role="tab"
+              aria-selected={g.id === current?.id}
+              className={`graph-tab${g.id === current?.id ? " active" : ""}`}
+              onClick={() => setActiveGraph(g.id)}
+            >
+              {g.id}
+            </button>
+          ))}
+        </div>
+      )}
+      {current && <LiveGraph key={current.id} ws={ws} graph={current} agents={agentList} />}
+      {running.length === 0 && <p className="dim">no active graphs</p>}
     </div>
   );
 }

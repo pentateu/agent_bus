@@ -2,7 +2,7 @@
 // `Authorization` header, so we hand-roll the parser (~60 lines) over `fetch`
 // with the in-memory bearer token.
 
-import { hasToken } from "./client";
+import { getToken, hasToken } from "./client";
 import type { BusEvent } from "./types";
 
 /** Parse one SSE frame (`event:` + joined `data:` lines) from a chunk. */
@@ -58,7 +58,13 @@ export async function* streamEvents(): AsyncGenerator<BusEvent> {
   for (;;) {
     try {
       const res = await fetch("/api/v1/events", {
-        headers: { Accept: "text/event-stream" },
+        // The events endpoint is bearer-authed like every /api/v1 route; the
+        // token is in memory only (caught live 2026-08-14 — without this the
+        // stream 401s forever and the dashboard never animates).
+        headers: {
+          Accept: "text/event-stream",
+          ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}),
+        },
       });
       if (!res.ok || !res.body) throw new Error(`events ${res.status}`);
       backoff = 1000;

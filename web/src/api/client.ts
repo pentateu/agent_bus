@@ -12,6 +12,11 @@ export function hasToken(): boolean {
   return token !== null;
 }
 
+/** The in-memory token, for the SSE stream (which cannot use `request`). */
+export function getToken(): string | null {
+  return token;
+}
+
 /** Read `#token=<t>` from the URL, keep it in memory, strip it from the URL. */
 export function bootstrapToken(): string | null {
   const hash = window.location.hash;

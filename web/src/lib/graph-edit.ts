@@ -87,6 +87,17 @@ export function removeNode(graph: GraphDef, id: string): GraphDef {
   };
 }
 
+/**
+ * Remove several nodes in one fold, applied sequentially to the accumulated
+ * graph (review M-3/F-2: applying each removal to the same stale `graph`
+ * resurrected all but the last node in a batch delete).
+ */
+export function removeNodes(graph: GraphDef, ids: readonly string[]): GraphDef {
+  let next = graph;
+  for (const id of ids) next = removeNode(next, id);
+  return next;
+}
+
 /** Wire `from → to` (add `to` to `from`'s deps). No-op when already wired. */
 export function connect(graph: GraphDef, from: string, to: string): GraphDef {
   return {

@@ -21,7 +21,7 @@ import "@xyflow/react/dist/style.css";
 
 import type { AgentState, GraphDef, NodeDef, NodeState } from "../api/types";
 import { layoutGraph } from "../lib/layout";
-import { connect, disconnect, removeNode } from "../lib/graph-edit";
+import { connect, disconnect, removeNodes } from "../lib/graph-edit";
 
 const ROLE_GLYPH: Record<string, string> = {
   dev: "⚙️",
@@ -145,24 +145,18 @@ export function WorkflowCanvas(props: WorkflowCanvasProps) {
     if (!onChange || !conn.source || !conn.target) return;
     onChange(connect(graph, conn.target, conn.source));
   };
-  // C-6: backspace removal used to update only React Flow's internal state —
-  // the parent graph kept the node, it reappeared on the next re-seed, and
-  // save persisted the "deleted" node. Route `remove` changes to onChange.
-  // F-2: fold a batch of removals into ONE onChange applied sequentially to
-  // the accumulated graph (each change used to rebuild from the same stale
-  // `graph` prop, so box-delete resurrected all but the last node).
   const onNodesChangeEdit: import("@xyflow/react").OnNodesChange<Node<CardData>> = (changes) => {
     onNodesChange(changes);
     if (!onChange) return;
-    let next = graph;
-    let dirty = false;
-    for (const change of changes) {
-      if (change.type === "remove" && change.id) {
-        next = removeNode(next, change.id);
-        dirty = true;
-      }
+    // C-6: backspace removal must reach the parent graph (and save). F-2 /
+    // M-3: fold a batch of removals into ONE onChange applied sequentially —
+    // each change used to rebuild from the same stale `graph` prop, so
+    // box-delete resurrected all but the last node.
+    const removed: string[] = [];
+    for (const c of changes) {
+      if (c.type === "remove" && "id" in c && c.id) removed.push(c.id);
     }
-    if (dirty) onChange(next);
+    if (removed.length > 0) onChange(removeNodes(graph, removed));
   };
   const onEdgesDeleteEdit = (deleted: Edge[]) => {
     if (!onChange) return;

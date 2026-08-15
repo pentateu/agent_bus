@@ -264,6 +264,15 @@ reused.
   `GET /api/v1/graphs/{id}/nodes?ws=` every ~2s, workspace-scoped since I-1.
   When workflow events gain `workspace_id`, the canvas can switch to SSE
   attribution; until then the ~2s poll is the documented mechanism).
+- **I-31 / M-2 (folded):** §5.1's triage list (`needs_decision`/`failed`/
+  `missing_role` — clickable), §6.2's `missing_role` ⚠ glyph, §6.3's
+  `loop_back` dashed edges, and the reducer's workflow-transition handling
+  describe SSE-driven behaviors the polling deviation does not provide
+  (`missing_role` nodes hold at `ready` with no persisted marker, and the
+  `MissingRole`/`loop_back` events have no consumer). These lines are part of
+  the I-31 build-or-strike decision (detailed design in progress): either
+  persist a pollable marker (e.g. a `needs_decision` row carrying the missing
+  role) or strike the lines from the spec.
 
 ### 5.2 Workspace view (`/workspaces/:ws`)
 

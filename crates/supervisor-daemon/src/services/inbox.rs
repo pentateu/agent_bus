@@ -94,6 +94,21 @@ impl InboxService {
                 tracing::warn!(ws = %ws, agent = %agent, error = %e, "pending delivery failed");
             }
         }
+        // M-1: prune dead-letter failure counters for entries that no longer
+        // exist or were delivered elsewhere (keeps the map bounded).
+        let live_ids: std::collections::HashSet<String> = {
+            let fleet = self.fleet.lock().await;
+            fleet
+                .workspaces()
+                .flat_map(|w| fleet.agents(&w.id).collect::<Vec<_>>())
+                .flat_map(|a| fleet.undelivered(&a.workspace_id, &a.agent_id))
+                .map(|e| e.id.clone())
+                .collect()
+        };
+        self.failed_deliveries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|id, _| live_ids.contains(id));
     }
 
     /// Drain undelivered entries for a workspace's agents (after `on`).
@@ -127,7 +142,9 @@ impl InboxService {
             // F-7: a permanently-failing entry (e.g. an unimplemented cmux
             // driver) must not block the whole queue forever. Once an entry
             // has failed DELIVERY_MAX_FAILURES times it is dead-lettered: we
-            // stop retrying it (and log once) so later entries can flow.
+            // stop retrying it so later entries can flow. The one-time log
+            // happens in `deliver` when the threshold is crossed (M-1: not
+            // on every sweep).
             undelivered
                 .into_iter()
                 .find(|e| {
@@ -138,16 +155,7 @@ impl InboxService {
                         .get(&e.id)
                         .copied()
                         .unwrap_or(0);
-                    if failures >= DELIVERY_MAX_FAILURES {
-                        tracing::error!(
-                            ws, agent, entry = %e.id,
-                            failures,
-                            "dead-lettered: delivery keeps failing; skipping"
-                        );
-                        false
-                    } else {
-                        true
-                    }
+                    failures < DELIVERY_MAX_FAILURES
                 })
                 .cloned()
         };
@@ -181,6 +189,17 @@ impl InboxService {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *failures.entry(entry.id.clone()).or_insert(0) += 1;
+                // M-1: log ONCE, when the entry crosses the dead-letter
+                // threshold — not on every 2s sweep afterwards.
+                if failures[&entry.id] == DELIVERY_MAX_FAILURES {
+                    tracing::error!(
+                        ws = %entry.workspace_id,
+                        agent = %entry.agent_id,
+                        entry = %entry.id,
+                        failures = DELIVERY_MAX_FAILURES,
+                        "dead-lettered: delivery keeps failing; skipping this entry"
+                    );
+                }
                 drop(failures);
                 return Err(e);
             }

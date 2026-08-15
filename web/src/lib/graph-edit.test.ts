@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { addNode, connect, disconnect, removeNode, updateNode, validateGraph } from "./graph-edit";
+import {
+  addNode,
+  connect,
+  disconnect,
+  removeNode,
+  removeNodes,
+  updateNode,
+  validateGraph,
+} from "./graph-edit";
 import type { GraphDef, NodeDef } from "../api/types";
 
 const blank = (): GraphDef => ({ id: "g", name: "g", nodes: [] });
@@ -56,6 +64,13 @@ describe("edit helpers", () => {
     g = removeNode(g, "a");
     expect(g.nodes.some((n) => n.id === "a")).toBe(false);
     expect(g.nodes.find((n) => n.id === "b")!.depends_on).toEqual([]);
+  });
+
+  it("batch-deletes all nodes in one sequential fold (M-3/F-2)", () => {
+    let g: GraphDef = { ...blank(), nodes: [node("a"), node("b", ["a"]), node("c", ["b"])] };
+    g = removeNodes(g, ["a", "b"]);
+    expect(g.nodes.map((n) => n.id)).toEqual(["c"]);
+    expect(g.nodes[0].depends_on).toEqual([]);
   });
 
   it("wires and unwires dependencies", () => {

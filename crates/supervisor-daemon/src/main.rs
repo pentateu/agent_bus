@@ -497,9 +497,14 @@ fn expand_home(path: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
-/// `~/.supervisor` (deviation 10: one supervisor-owned state dir).
+/// The state dir: `SUPERVISOR_STATE_DIR`, else `$HOME/.supervisor` (deviation
+/// 10: one supervisor-owned state dir). The env override pins it even when a
+/// sandboxed shell sets HOME to a temp dir.
 #[must_use]
 fn default_state_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("SUPERVISOR_STATE_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
     std::path::PathBuf::from(home).join(".supervisor")
 }

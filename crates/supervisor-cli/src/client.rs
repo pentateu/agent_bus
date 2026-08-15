@@ -29,8 +29,14 @@ impl ClientConfig {
     }
 }
 
-/// The default state dir.
+/// The default state dir: `SUPERVISOR_STATE_DIR`, else `$HOME/.supervisor`.
+/// The env override makes the state dir deterministic even when a sandboxed
+/// shell sets HOME to a temp dir (caught live: the daemon and CLI resolved
+/// different state dirs, so every command 401'd).
 fn default_state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SUPERVISOR_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
     PathBuf::from(home).join(".supervisor")
 }

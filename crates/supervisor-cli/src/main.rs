@@ -306,8 +306,12 @@ fn stop(cli: &Cli) -> Result<()> {
     }
 }
 
-/// The default state dir, mirroring the daemon's `~/.supervisor`.
+/// The default state dir, mirroring the daemon's resolution:
+/// `SUPERVISOR_STATE_DIR`, else `$HOME/.supervisor`.
 fn default_state_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("SUPERVISOR_STATE_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
     std::path::PathBuf::from(home).join(".supervisor")
 }

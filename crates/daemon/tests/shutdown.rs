@@ -3,6 +3,8 @@
 //! with a short idle/sweep override instead of relying only on the pure
 //! `should_shutdown` predicate.
 
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
+
 use std::io::Write as _;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -39,7 +41,7 @@ fn wait_for_socket(state_dir: &Path) {
 
 #[test]
 fn a_parked_waiter_defers_idle_shutdown_until_it_times_out() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir().unwrap();
     let mut child = spawn_daemon(dir.path());
     wait_for_socket(dir.path());
 

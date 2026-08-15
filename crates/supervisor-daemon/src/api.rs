@@ -236,7 +236,17 @@ async fn register_workspace(
     let existing = fleet.workspace(&body.id).cloned();
     let workspace = supervisor_core::types::Workspace {
         id: body.id.clone(),
-        path: body.path,
+        // Defensive: expand a literal `~` in a hand-provided path (the
+        // discovery path does the same; a raw tilde breaks spawn/current_dir).
+        path: {
+            let raw = std::path::Path::new(&body.path).to_path_buf();
+            let raw = raw.to_string_lossy();
+            if let Some(rest) = raw.strip_prefix("~/") {
+                std::env::var("HOME").unwrap_or_default() + "/" + rest
+            } else {
+                body.path.clone()
+            }
+        },
         port: existing.as_ref().and_then(|w| w.port),
         server_pid: existing.as_ref().and_then(|w| w.server_pid),
         state: supervisor_core::types::WorkspaceState::Off,

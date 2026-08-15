@@ -77,6 +77,9 @@ pub enum Response {
         id: String,
         /// RFC 3339 timestamp of when the message was stamped on send, so a
         /// publisher can report when its post went out without racing a clock.
+        /// I-14: `default` so a new CLI decoding an old resident daemon's
+        /// reply (which predates the field) does not fail serde.
+        #[serde(default)]
         ts: String,
     },
     Messages {

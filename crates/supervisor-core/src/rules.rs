@@ -363,10 +363,17 @@ impl Condition {
             match key.as_str() {
                 "agent.role" | "agent" => match val {
                     toml::Value::Table(agent) => {
-                        if let Some(role) = agent.get("role").or_else(|| agent.get("type"))
-                            && let Some(cmp) = parse_str_cmp(role)
-                        {
-                            cond.agent_role = Some(cmp);
+                        // I-23: a typo'd nested key (e.g. `agent = { r0le = ... }`)
+                        // must disable the rule, not silently match everything.
+                        for (k, v) in agent {
+                            match k.as_str() {
+                                "role" | "type" => {
+                                    if let Some(cmp) = parse_str_cmp(v) {
+                                        cond.agent_role = Some(cmp);
+                                    }
+                                }
+                                other => cond.unknown_keys.push(format!("agent.{other}")),
+                            }
                         }
                     }
                     _ => cond.agent_role = parse_str_cmp(val),
@@ -957,6 +964,18 @@ action = { kind = "post", to = "a", body = "b" }
         assert_eq!(cond.unknown_keys, vec!["bogus_key".to_owned()]);
         assert!(cond.is_disabled());
         assert!(!cond.matches(&sit()));
+    }
+
+    #[test]
+    fn typo_in_nested_agent_table_disables_the_rule() {
+        // I-23: `when = { agent = { r0le = "tester" } }` must not match
+        // everything — the unknown nested key disables the rule.
+        let when: toml::Value =
+            toml::from_str(r#"when = { agent = { r0le = "tester" } }"#).unwrap();
+        let cond = Condition::from_toml(&when["when"]);
+        assert!(cond.is_disabled(), "typo'd nested key must disable the rule");
+        assert!(!cond.matches(&sit()));
+        assert!(cond.unknown_keys.iter().any(|k| k.contains("r0le")));
     }
 
     #[test]

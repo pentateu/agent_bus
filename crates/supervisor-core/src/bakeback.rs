@@ -71,7 +71,8 @@ pub fn propose(clusters: &[Cluster], min_occurrences: usize) -> Vec<Proposal> {
             continue;
         }
         let Some(first) = cluster.decisions.first() else { continue };
-        let Some(rule_toml) = generate_rule_toml(first, cluster.decisions.len()) else {
+        let confidence = observed_success_rate(&cluster.decisions);
+        let Some(rule_toml) = generate_rule_toml(first, confidence) else {
             continue;
         };
         out.push(Proposal {
@@ -79,7 +80,7 @@ pub fn propose(clusters: &[Cluster], min_occurrences: usize) -> Vec<Proposal> {
             rule_toml,
             signature: cluster.signature.clone(),
             cluster_size: cluster.decisions.len(),
-            confidence: observed_success_rate(&cluster.decisions),
+            confidence,
             status: ProposalStatus::Pending,
             created_at: now.clone(),
             resolved_at: None,
@@ -111,13 +112,15 @@ pub fn observed_success_rate(decisions: &[DecisionRecord]) -> f64 {
 
 /// Build the `[[rule]]` TOML block for a proposal from one representative
 /// decision (its situation + action), generalizing the target to `$agent`.
+/// The embedded confidence is the CLUSTER's observed success rate, not the
+/// single representative decision's (review I-22 — a 0.25-success cluster
+/// used to produce a rule that always cleared the 0.8 threshold).
 #[must_use]
-pub fn generate_rule_toml(decision: &DecisionRecord, _cluster_size: usize) -> Option<String> {
+pub fn generate_rule_toml(decision: &DecisionRecord, cluster_confidence: f64) -> Option<String> {
     let sit: Situation = serde_json::from_value(decision.situation.clone()).ok()?;
     let action: Action = serde_json::from_value(decision.decision.clone()).ok()?;
     let generalized = generalize(&action, &sit);
-    let confidence = observed_success_rate(std::slice::from_ref(decision));
-    build_rule_toml(&sit, &generalized, confidence).ok()
+    build_rule_toml(&sit, &generalized, cluster_confidence).ok()
 }
 
 /// Replace the specific agent with `$agent` in an action's `to`/`body` so the
@@ -339,7 +342,7 @@ mod tests {
             Some(("bug", "fix", NodeState::Running)),
         );
         let d = decision(&s);
-        let toml = generate_rule_toml(&d, 3).expect("proposal TOML generated");
+        let toml = generate_rule_toml(&d, 0.7).expect("proposal TOML generated");
         let rules = crate::rules::Rule::parse_toml(&toml).expect("proposed TOML re-parses");
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].when.agent_role, Some(crate::rules::StrCmp::Eq("tester".to_owned())));
@@ -349,6 +352,10 @@ mod tests {
             Action::Post { to, .. } => assert_eq!(to, "$agent", "generalized to $agent"),
             other => panic!("expected a post, got {other:?}"),
         }
+        assert_eq!(
+            rules[0].confidence, 0.7,
+            "I-22: the embedded confidence is the cluster's rate, not the single decision's"
+        );
     }
 
     #[test]

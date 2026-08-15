@@ -37,13 +37,13 @@ pub fn run(pattern: &str, label: &str, timeout_secs: Option<u64>, json: bool) ->
 
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            // Out of budget: surface whatever was most recently wrong. If the
-            // daemon never answered, this is the "daemon closed the connection"
-            // failure, mapped to exit 3 when it is an unavailability.
-            return Err(last_error.unwrap_or_else(|| {
-                anyhow::anyhow!("wait budget expired before the daemon answered")
-            }));
+        if remaining.is_zero() && last_error.is_some() {
+            // Tried and the daemon never answered within the budget: surface
+            // whatever was most recently wrong (exit 3 for unavailability).
+            // A fresh `--timeout 0` has no error yet and must still ask the
+            // daemon once (I-17: it returns Timeout → exit 2, matching the
+            // documented "nothing pending" contract).
+            return Err(last_error.unwrap());
         }
 
         let response = match Client::connect().and_then(|mut client| {

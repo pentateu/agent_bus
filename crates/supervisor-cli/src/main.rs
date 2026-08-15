@@ -270,6 +270,37 @@ fn status(cli: &Cli) -> Result<()> {
             }
         }
     }
+    // A5: the triage section — one line per attention-state node/agent.
+    match client.triage() {
+        Ok(triage) => {
+            let agents = triage["agents"].as_array().cloned().unwrap_or_default();
+            let nodes = triage["nodes"].as_array().cloned().unwrap_or_default();
+            if agents.is_empty() && nodes.is_empty() {
+                println!("triage: nothing needs attention");
+            } else {
+                for a in &agents {
+                    println!(
+                        "triage: agent {}/{} ({})",
+                        a["ws"].as_str().unwrap_or_default(),
+                        a["agent_id"].as_str().unwrap_or_default(),
+                        a["state"].as_str().unwrap_or_default(),
+                    );
+                }
+                for n in &nodes {
+                    println!(
+                        "triage: node {}/{} ({}) in {}",
+                        n["graph_id"].as_str().unwrap_or_default(),
+                        n["node_id"].as_str().unwrap_or_default(),
+                        n["state"].as_str().unwrap_or_default(),
+                        n["ws"].as_str().unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("triage unavailable: {e}");
+        }
+    }
     Ok(())
 }
 

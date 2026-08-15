@@ -158,6 +158,11 @@ impl ApiClient {
         serde_json::from_value(value).context("decode decision log")
     }
 
+    /// A5: the triage aggregate (agents + nodes needing attention).
+    pub fn triage(&self) -> Result<serde_json::Value> {
+        self.get("/api/v1/triage")
+    }
+
     pub fn rules(&self) -> Result<Vec<serde_json::Value>> {
         let value = self.get("/api/v1/rules")?;
         serde_json::from_value(value).context("decode rules")

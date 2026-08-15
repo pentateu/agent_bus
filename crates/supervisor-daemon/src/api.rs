@@ -89,6 +89,7 @@ pub fn router(state: &ApiState) -> Router {
         .route("/api/v1/rules", get(list_rules).post(add_rule))
         .route("/api/v1/rules/reload", post(reload_rules))
         .route("/api/v1/decision-log", get(decision_log))
+        .route("/api/v1/triage", get(triage))
         .route("/api/v1/decision-log/{id}/outcome", post(decision_outcome))
         .route("/api/v1/bakeback/proposals", get(list_proposals))
         .route("/api/v1/bakeback/preview", post(preview_bakeback))
@@ -631,6 +632,53 @@ async fn decide_node(
             (status, Json(ApiError { error: msg })).into_response()
         }
     }
+}
+
+/// A5: `GET /api/v1/triage` — the read-only attention aggregate: agents in
+/// `waiting_input` / `blocked_permission` / `error`, and nodes in
+/// `needs_decision` / `failed` / `blocked` / `missing_role`. Dumb on purpose:
+/// sorting and filtering are client-side.
+async fn triage(State(state): State<ApiState>) -> Response {
+    let fleet = state.fleet.lock().await;
+    let mut agents = Vec::new();
+    let mut nodes = Vec::new();
+    for ws in fleet.workspaces() {
+        for a in fleet.agents(&ws.id) {
+            if matches!(
+                a.state,
+                supervisor_core::types::AgentState::WaitingInput
+                    | supervisor_core::types::AgentState::BlockedPermission
+                    | supervisor_core::types::AgentState::Error
+            ) {
+                agents.push(serde_json::json!({
+                    "ws": ws.id,
+                    "agent_id": a.agent_id,
+                    "state": a.state,
+                    "permission_id": null,
+                }));
+            }
+        }
+        for g in fleet.graphs() {
+            for row in fleet.node_states(&ws.id, &g.id) {
+                if matches!(
+                    row.state,
+                    supervisor_core::types::NodeState::NeedsDecision
+                        | supervisor_core::types::NodeState::Failed
+                        | supervisor_core::types::NodeState::Blocked
+                        | supervisor_core::types::NodeState::MissingRole
+                ) {
+                    nodes.push(serde_json::json!({
+                        "ws": ws.id,
+                        "graph_id": g.id,
+                        "node_id": row.node_id,
+                        "state": row.state,
+                        "error": row.error,
+                    }));
+                }
+            }
+        }
+    }
+    Json(serde_json::json!({ "agents": agents, "nodes": nodes })).into_response()
 }
 
 /// Ensure a workspace is `on` and start the graph for an intake item, linking

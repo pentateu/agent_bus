@@ -22,6 +22,35 @@ pub enum Priority {
     High,
 }
 
+/// The coordination role a message plays.
+///
+/// The bus transports every kind identically; `kind` is how the rule engine
+/// and the DAG engine decide what a message *means* without parsing the body.
+/// `Instruction` is the default so an ordinary post behaves exactly like
+/// today's bus message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageKind {
+    /// A direct instruction to the recipient: "do this".
+    #[default]
+    Instruction,
+    /// A question or a request for information.
+    Request,
+    /// The reply to a `Request`; carries `in_reply_to`.
+    Answer,
+    /// A completion acknowledgement; carries `ack` with the task id.
+    Ack,
+    /// A state transition event posted by the orchestrator.
+    State,
+    /// An arbitrary workflow or coordination event.
+    Event,
+    /// An escalation posted to the manager's inbox (see the orchestration
+    /// spec). The manager replies with [`MessageKind::DecisionResponse`].
+    DecisionRequest,
+    /// The manager's ruling on a [`MessageKind::DecisionRequest`].
+    DecisionResponse,
+}
+
 /// One published message.
 ///
 /// `id` is a ULID: sortable by creation time, so it doubles as the cursor
@@ -45,6 +74,32 @@ pub struct Message {
     /// readable: a record without it is a normal (exclusive) message.
     #[serde(default)]
     pub broadcast: bool,
+    /// The coordination role of this message. Absent means `Instruction`,
+    /// so pre-orchestration logs keep parsing and behaving as before.
+    #[serde(default, skip_serializing_if = "MessageKind::is_instruction")]
+    pub kind: MessageKind,
+    /// Recipient agent id for point-to-point delivery. Absent means the
+    /// message is topic-addressed (first pick-up wins). `to` and topic
+    /// routing coexist: observers can match the topic while the addressed
+    /// agent alone consumes the message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// The id of the message this one answers, for routing `Answer`s back to
+    /// the asker deterministically without an LLM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    /// For [`MessageKind::Ack`]: the task id being acknowledged
+    /// (e.g. `"dev.done"`). This is how the DAG learns a node finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack: Option<String>,
+}
+
+impl MessageKind {
+    /// True for the serde-default variant, used to keep old JSONL stable.
+    #[must_use]
+    pub const fn is_instruction(&self) -> bool {
+        matches!(*self, Self::Instruction)
+    }
 }
 
 impl Message {
@@ -57,7 +112,26 @@ impl Message {
         let from = from.unwrap_or_else(|| {
             topic.as_str().rsplit('/').next().unwrap_or(topic.as_str()).to_owned()
         });
-        Self { id: next_id(), ts: now_rfc3339(), topic, priority, from, body, broadcast: false }
+        Self {
+            id: next_id(),
+            ts: now_rfc3339(),
+            topic,
+            priority,
+            from,
+            body,
+            broadcast: false,
+            kind: MessageKind::Instruction,
+            to: None,
+            in_reply_to: None,
+            ack: None,
+        }
+    }
+
+    /// Build an acknowledgement: `kind = Ack`, `ack = task`. The body should
+    /// summarize what finished; routing and DAG advance key off the task id.
+    #[must_use]
+    pub fn acknowledge(topic: Topic, task: String, body: String, from: Option<String>) -> Self {
+        Self::new(topic, body, Priority::Normal, from).kind(MessageKind::Ack).ack(task)
     }
 
     /// Mark this message as a broadcast.
@@ -65,6 +139,43 @@ impl Message {
     pub fn broadcast(mut self) -> Self {
         self.broadcast = true;
         self
+    }
+
+    /// Set the coordination role of this message.
+    #[must_use]
+    pub fn kind(mut self, kind: MessageKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Address this message to a specific agent's inbox (point-to-point).
+    /// An unaddressed message is topic-routed as today.
+    #[must_use]
+    pub fn to(mut self, agent: impl Into<String>) -> Self {
+        self.to = Some(agent.into());
+        self
+    }
+
+    /// Link this message to the one it answers, so a reply can be routed back
+    /// to the asker without parsing the body.
+    #[must_use]
+    pub fn in_reply_to(mut self, id: impl Into<String>) -> Self {
+        self.in_reply_to = Some(id.into());
+        self
+    }
+
+    /// Set the acknowledged task id. Intended for `kind = Ack`.
+    #[must_use]
+    pub fn ack(mut self, task: impl Into<String>) -> Self {
+        self.ack = Some(task.into());
+        self
+    }
+
+    /// True when this message is addressed to a specific agent inbox rather
+    /// than routed purely by topic.
+    #[must_use]
+    pub fn is_addressed(&self) -> bool {
+        self.to.is_some()
     }
 
     /// Serialize to a single JSONL line (no trailing newline).
@@ -110,7 +221,8 @@ fn next_id() -> Ulid {
 /// Current time as an RFC 3339 / ISO 8601 UTC string with millisecond precision.
 ///
 /// Hand-rolled to avoid a `chrono`/`time` dependency for one format string.
-fn now_rfc3339() -> String {
+#[must_use]
+pub fn now_rfc3339() -> String {
     let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = d.as_secs();
     let millis = d.subsec_millis();
@@ -212,6 +324,69 @@ mod tests {
     #[test]
     fn priority_defaults_to_normal_when_absent() {
         assert_eq!(Priority::default(), Priority::Normal);
+    }
+
+    #[test]
+    fn new_message_is_an_unaddressed_instruction() {
+        let m = Message::new(topic(), "x".to_owned(), Priority::Normal, None);
+        assert_eq!(m.kind, MessageKind::Instruction);
+        assert_eq!(m.to, None);
+        assert_eq!(m.in_reply_to, None);
+        assert_eq!(m.ack, None);
+        assert!(!m.is_addressed());
+    }
+
+    #[test]
+    fn addressing_builders_set_fields() {
+        let m = Message::new(topic(), "x".to_owned(), Priority::High, None)
+            .to("dev_01")
+            .kind(MessageKind::Request)
+            .in_reply_to("01JQ8F2K9X3M4N5P6Q7R8S9T0V");
+        assert_eq!(m.to.as_deref(), Some("dev_01"));
+        assert_eq!(m.kind, MessageKind::Request);
+        assert_eq!(m.in_reply_to.as_deref(), Some("01JQ8F2K9X3M4N5P6Q7R8S9T0V"));
+        assert!(m.is_addressed());
+    }
+
+    #[test]
+    fn ack_constructor_sets_kind_and_task() {
+        let m = Message::acknowledge(
+            topic(),
+            "dev.done".to_owned(),
+            "feature shipped".to_owned(),
+            None,
+        );
+        assert_eq!(m.kind, MessageKind::Ack);
+        assert_eq!(m.ack.as_deref(), Some("dev.done"));
+        assert!(!m.is_addressed(), "an ack is routed by topic, not to a recipient");
+    }
+
+    #[test]
+    fn new_fields_default_when_absent_in_jsonl() {
+        let m = Message::new(topic(), "plain".to_owned(), Priority::Normal, None);
+        let back = Message::from_jsonl(&m.to_jsonl().unwrap()).unwrap();
+        assert_eq!(back.kind, MessageKind::Instruction);
+        assert_eq!(back.to, None);
+        assert_eq!(back.ack, None);
+        assert_eq!(back, m, "a message without orchestration fields round-trips unchanged");
+    }
+
+    #[test]
+    fn legacy_jsonl_without_new_fields_parses() {
+        let line = r#"{"id":"01JQ8F2K9X3M4N5P6Q7R8S9T0V","ts":"2026-08-10T09:00:00.000Z","topic":"iot_base/dev_01","priority":"normal","from":"dev_01","body":"ready for review","broadcast":false}"#;
+        let m = Message::from_jsonl(line).unwrap();
+        assert_eq!(m.kind, MessageKind::Instruction);
+        assert_eq!(m.to, None);
+        assert_eq!(m.ack, None);
+    }
+
+    #[test]
+    fn message_kind_roundtrips_through_jsonl() {
+        let m = Message::acknowledge(topic(), "test.done".to_owned(), "all green".to_owned(), None);
+        let back = Message::from_jsonl(&m.to_jsonl().unwrap()).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.kind, MessageKind::Ack);
+        assert_eq!(back.ack.as_deref(), Some("test.done"));
     }
 
     #[test]

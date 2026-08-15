@@ -98,13 +98,17 @@ pub fn dispatch(
             // and the state owns `BusTally` — the one place both are in scope.
             let body_bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
             let mut message = Message::new(topic, body, priority, from);
+            // Read the stamp before `publish` moves the message: it is the
+            // authoritative "sent at" the daemon recorded, and the publisher
+            // echoes it back so post and receive agree on one timestamp.
+            let ts = message.ts.clone();
             if broadcast {
                 message = message.broadcast();
             }
             match state.partition_mut(&name).and_then(|p| p.publish(message)) {
                 Ok(id) => {
                     state.bus_tally.record_post(body_bytes);
-                    Dispatch::Reply(Response::Posted { id: id.to_string() })
+                    Dispatch::Reply(Response::Posted { id: id.to_string(), ts })
                 }
                 Err(e) => Dispatch::Reply(error(&e)),
             }

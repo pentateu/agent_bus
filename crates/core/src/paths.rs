@@ -140,6 +140,43 @@ pub fn socket_path(state_dir: &Path) -> PathBuf {
     state_dir.join("agent-bus.sock")
 }
 
+/// Resolve where the daemon's log file lives.
+///
+/// An explicit `AGENT_BUS_STATE_DIR` (isolated runs, tests) keeps the log next
+/// to its state so a test can find it without touching the user's logs.
+/// Otherwise the log goes to the platform log directory, where a human looking
+/// for it would actually look. `fallback_state_dir` is used only on platforms
+/// without a conventional log directory.
+#[must_use]
+pub fn resolve_daemon_log_path(
+    override_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+    fallback_state_dir: &Path,
+) -> PathBuf {
+    if let Some(dir) = override_dir {
+        return dir.join("daemon.log");
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(home) = home_dir {
+        return home.join("Library").join("Logs").join("agent-bus-daemon.log");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home_dir;
+    }
+    fallback_state_dir.join("daemon.log")
+}
+
+/// Resolve the daemon log path from the process environment.
+#[must_use]
+pub fn daemon_log_path() -> PathBuf {
+    resolve_daemon_log_path(
+        std::env::var_os("AGENT_BUS_STATE_DIR").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        &state_dir_from_env(),
+    )
+}
+
 #[must_use]
 pub fn lock_path(state_dir: &Path) -> PathBuf {
     state_dir.join("agent-bus.lock")
@@ -202,6 +239,21 @@ mod tests {
         let dir = std::path::PathBuf::from("/tmp/abtest");
         assert_eq!(socket_path(&dir), dir.join("agent-bus.sock"));
         assert_eq!(lock_path(&dir), dir.join("agent-bus.lock"));
+    }
+
+    #[test]
+    fn daemon_log_follows_an_explicit_state_dir() {
+        let dir = std::path::PathBuf::from("/tmp/abtest");
+        let path = resolve_daemon_log_path(Some(dir.clone()), None, &dir);
+        assert_eq!(path, dir.join("daemon.log"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn daemon_log_uses_the_platform_log_dir_by_default() {
+        let path =
+            resolve_daemon_log_path(None, Some("/Users/u".into()), std::path::Path::new("/tmp/ab"));
+        assert_eq!(path, std::path::PathBuf::from("/Users/u/Library/Logs/agent-bus-daemon.log"));
     }
 
     #[test]

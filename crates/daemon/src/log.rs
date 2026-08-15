@@ -79,11 +79,11 @@ impl PartitionLog {
                     // this really is the line number in the file. The parse
                     // error is included: a skipped record is a real anomaly and
                     // must not be reported as a bare count with no cause.
-                    eprintln!(
-                        "agent-bus: skipping corrupt record in {} (line {}): {error}",
+                    crate::logging::log_msg(&format!(
+                        "skipping corrupt record in {} (line {}): {error}",
                         path.display(),
                         index + 1
-                    );
+                    ));
                 }
             }
         }

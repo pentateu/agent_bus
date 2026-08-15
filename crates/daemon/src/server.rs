@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_bus_core::{IDLE_SHUTDOWN_SECS, PartitionName, Pattern};
+use agent_bus_core::{DEFAULT_WAIT_TIMEOUT_SECS, MAX_WAIT_TIMEOUT_SECS, PartitionName, Pattern};
 use agent_bus_protocol::{Request, Response, encode};
 use anyhow::{Context, Result};
 use tokio::{
@@ -15,25 +15,9 @@ use tokio::{
 
 use crate::{
     handler::{Dispatch, dispatch},
+    logging::log_msg,
     state::BusState,
 };
-
-/// Default `wait` timeout when the client does not supply one: 30 minutes.
-/// Bounded so a client never blocks forever against a harness tool timeout.
-const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 1800;
-
-/// Hard ceiling on a client-supplied `wait` timeout: 1.5 hours.
-///
-/// Set to [`IDLE_SHUTDOWN_SECS`] because that is the real limit already: the
-/// daemon exits after that long without activity, so a longer wait cannot be
-/// honoured anyway — and by then retention (1 hour) has emptied the log, so
-/// there is nothing left for a longer wait to find.
-///
-/// The clamp exists because the wire value is untrusted. `u64::MAX` seconds
-/// overflowed `Instant + Duration` and panicked the connection task, which
-/// destroyed the connection with no response and made the client exit 1
-/// instead of the documented 2 or 3.
-const MAX_WAIT_TIMEOUT_SECS: u64 = IDLE_SHUTDOWN_SECS;
 
 /// Serve until a stop request or idle shutdown.
 ///
@@ -49,14 +33,21 @@ pub async fn serve(socket: &Path, state: Arc<Mutex<BusState>>) -> Result<()> {
     let listener =
         UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
 
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(4);
-    tokio::spawn(crate::sweep::run(Arc::clone(&state), shutdown_tx.clone()));
-
     // Parked connections (wait/follow) live outside the state mutex, so their
     // counts cannot live in `BusState`; these atomics are bumped on entry to
-    // the parked loop and decremented on exit by the RAII guards.
+    // the parked loop and decremented on exit by the RAII guards. Created
+    // before the sweep so the sweep can refuse to shut the daemon down while
+    // clients are still parked in a wait.
     let active_waiters = Arc::new(AtomicU64::new(0));
     let active_followers = Arc::new(AtomicU64::new(0));
+
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(4);
+    tokio::spawn(crate::sweep::run(
+        Arc::clone(&state),
+        shutdown_tx.clone(),
+        Arc::clone(&active_waiters),
+        Arc::clone(&active_followers),
+    ));
 
     // Built once, outside the loop. `ctrl_c()` returns a fresh future each call,
     // and a `select!` arm that rebuilds it every iteration re-registers the
@@ -79,15 +70,21 @@ pub async fn serve(socket: &Path, state: Arc<Mutex<BusState>>) -> Result<()> {
                             if let Err(e) =
                                 handle_connection(stream, state, shutdown, socket_path, aw, af).await
                             {
-                                eprintln!("agent-bus: connection error: {e:#}");
+                                log_msg(&format!("connection error: {e:#}"));
                             }
                         });
                     }
-                    Err(e) => eprintln!("agent-bus: accept failed: {e}"),
+                    Err(e) => log_msg(&format!("accept failed: {e}")),
                 }
             }
-            _ = shutdown_rx.recv() => break,
-            _ = &mut interrupt => break,
+            _ = shutdown_rx.recv() => {
+                log_msg("shutdown requested");
+                break;
+            }
+            _ = &mut interrupt => {
+                log_msg("interrupted (SIGINT/SIGTERM)");
+                break;
+            }
         }
     }
 
@@ -139,6 +136,7 @@ async fn handle_connection(
 
             Dispatch::Shutdown => {
                 send(&mut write_half, &Response::Ok).await?;
+                log_msg("stop requested by a client");
                 let _ = shutdown.send(()).await;
                 return Ok(());
             }

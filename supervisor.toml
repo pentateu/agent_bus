@@ -1,0 +1,32 @@
+[project]
+name = "agent-bus"
+path = "/Users/rafael/Development/agent-bus"
+
+[server]
+port = 4101
+default_agent = "dev_01"
+
+[[agent]]
+id = "dev_01"
+role = "dev"
+
+[[agent]]
+id = "reviewer_01"
+role = "reviewer"
+mode = "background"
+
+[[agent]]
+id = "tester_01"
+role = "tester"
+mode = "background"
+
+[[agent]]
+id = "designer_01"
+role = "designer"
+mode = "background"
+
+[[agent]]
+id = "memory_keeper_01"
+role = "memory-keeper"
+mode = "background"
+

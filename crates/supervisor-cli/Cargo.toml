@@ -1,0 +1,24 @@
+[package]
+name = "supervisor-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "supervisor"
+path = "src/main.rs"
+
+[dependencies]
+supervisor-core = { workspace = true }
+supervisor-daemon = { path = "../supervisor-daemon" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

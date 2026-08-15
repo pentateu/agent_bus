@@ -39,11 +39,11 @@ pub fn run(
     let response = client.request(&Request::Post { topic, body, priority, from, broadcast })?;
 
     match response {
-        Response::Posted { id } => {
+        Response::Posted { id, ts } => {
             if json {
-                println!("{}", serde_json::json!({ "id": id }));
+                println!("{}", serde_json::json!({ "id": id, "ts": ts }));
             } else {
-                println!("posted {id}");
+                println!("posted {id} at {ts}");
             }
             Ok(ExitCode::Success)
         }

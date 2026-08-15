@@ -245,11 +245,13 @@ fn status(cli: &Cli) -> Result<()> {
         let id = ws["id"].as_str().unwrap_or_default();
         if let Ok(agents) = client.agents(id) {
             for agent in &agents {
+                // I-21: queue depth in the status output.
                 println!(
-                    "  {:20} role={:12} state={:10} session={}",
+                    "  {:20} role={:12} state={:10} queued={} session={}",
                     agent["agent_id"].as_str().unwrap_or_default(),
                     agent["role"].as_str().unwrap_or_default(),
                     agent["state"].as_str().unwrap_or_default(),
+                    agent["inbox_depth"].as_u64().unwrap_or(0),
                     agent["session_id"].as_str().unwrap_or("none"),
                 );
             }
@@ -382,7 +384,14 @@ fn smoke(cli: &Cli, ws: &str, graph: &str, timeout: u64) -> Result<()> {
     println!("         on: OK");
 
     println!("hop 2/5  start: starting the graph");
-    let _ = client.start_graph(ws, graph, &std::collections::BTreeMap::new())?;
+    let start = client.start_graph(ws, graph, &std::collections::BTreeMap::new())?;
+    if start.get("already_running").and_then(serde_json::Value::as_bool) == Some(true) {
+        // I-11: a re-run would PASS with zero agent work (persisted Done rows
+        // + the start no-op) — fail loudly instead.
+        anyhow::bail!(
+            "smoke: graph {graph} is already live in {ws} — stop it first, or this would false-pass on persisted state"
+        );
+    }
     println!("         start: OK (root nodes should be Ready)");
 
     println!("hop 3/5  deliver: waiting for a start message to reach an agent (node → Running)");
@@ -409,13 +418,20 @@ fn smoke(cli: &Cli, ws: &str, graph: &str, timeout: u64) -> Result<()> {
             }
         }
         let all_done = !seen.is_empty() && seen.values().all(|s| s == "done");
-        if all_done {
+        if all_done && saw_running {
+            // I-11: PASS requires observing a live Running hop — "all done"
+            // alone can come from persisted rows of a prior run.
             println!("smoke: PASS — the live chain completed end to end");
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             println!("smoke: TIMED OUT after {timeout}s — chain stalled");
             println!("  observed: running={saw_running} done={saw_done}");
+            if all_done && !saw_running {
+                println!(
+                    "  note: all nodes are done but no Running hop was observed — likely a re-run over persisted state"
+                );
+            }
             println!("  last node states:");
             for (id, state) in &seen {
                 println!("  node {id:24} → {state}");
@@ -602,14 +618,16 @@ fn web(cli: &Cli) -> Result<()> {
 fn install_launchd(cli: &Cli) -> Result<()> {
     let daemon_bin =
         std::env::var("SUPERVISOR_DAEMON_BIN").unwrap_or_else(|_| "supervisor-daemon".to_owned());
-    let state_dir = cli.state_dir.clone().unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
-        std::path::PathBuf::from(home).join(".supervisor")
-    });
+    // I-13: honor --state-dir / SUPERVISOR_STATE_DIR consistently, and pass
+    // the override through to the plist so the daemon it launches uses the
+    // same state dir as the CLI.
+    let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
+    let env_override = std::env::var_os("SUPERVISOR_STATE_DIR");
     supervisor_daemon::launchd::install(
         &daemon_bin,
         &state_dir,
         supervisor_daemon::launchd::DEFAULT_LABEL,
+        env_override.as_deref().map(std::path::Path::new),
     )?;
     println!(
         "installed launchd agent {label} for {daemon_bin}",
@@ -620,10 +638,8 @@ fn install_launchd(cli: &Cli) -> Result<()> {
 
 /// Write the supervisor agent (C13) assets.
 fn agent_install(cli: &Cli) -> Result<()> {
-    let state_dir = cli.state_dir.clone().unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
-        std::path::PathBuf::from(home).join(".supervisor")
-    });
+    // I-13: resolve the state dir consistently (env override honored).
+    let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
     supervisor_daemon::agent_assets::install(&state_dir)?;
     println!("installed supervisor agent assets under {}/agent", state_dir.display());
     Ok(())

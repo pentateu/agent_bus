@@ -220,18 +220,20 @@ impl WorkflowRunner {
         ws: &str,
         graph_id: &str,
         vars: BTreeMap<String, String>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // M3 dedupe: never start twice while an instance is live. The check
         // and the insert share one lock hold (review I-3): pre-loading the
         // instance keeps the atomicity, so two concurrent starts cannot both
-        // pass the guard — the loser sees the entry and no-ops.
+        // pass the guard — the loser sees the entry and no-ops. Returns
+        // `true` when a fresh instance started, `false` when one is live
+        // (I-11: callers distinguish so the smoke cannot false-pass).
         let instance = self.load_instance(graph_id).await?;
         {
             let mut instances =
                 self.instances.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if instances.contains_key(&(ws.to_owned(), graph_id.to_owned())) {
                 tracing::debug!(ws, graph = graph_id, "graph already running; no-op");
-                return Ok(());
+                return Ok(false);
             }
             instances.insert((ws.to_owned(), graph_id.to_owned()), instance.clone());
         }
@@ -253,7 +255,7 @@ impl WorkflowRunner {
             )
             .await;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Rebuild an instance from the fleet's graph data.

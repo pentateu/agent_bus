@@ -300,7 +300,16 @@ async fn resume(State(state): State<ApiState>) -> Response {
 async fn list_agents(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
     let fleet = state.fleet.lock().await;
     let agents = fleet.agents(&id).cloned().collect::<Vec<_>>();
-    match serde_json::to_value(&agents) {
+    // I-21: surface the per-agent inbox queue depth (§4.15 status requires it).
+    let payload: Vec<serde_json::Value> = agents
+        .iter()
+        .map(|a| {
+            let mut value = serde_json::to_value(a).unwrap_or_default();
+            value["inbox_depth"] = serde_json::json!(fleet.inbox_depth(&id, &a.agent_id));
+            value
+        })
+        .collect();
+    match serde_json::to_value(&payload) {
         Ok(value) => Json(value).into_response(),
         Err(e) => ApiError { error: e.to_string() }.into_response(),
     }
@@ -537,8 +546,17 @@ async fn start_workflow(
         return ApiError { error: format!("workspace on failed: {e}") }.into_response();
     }
     match state.workflows.start_graph(&ws, &graph, body.vars).await {
-        Ok(()) => Json(serde_json::json!({ "started": true, "graph": graph, "workspace": ws }))
-            .into_response(),
+        Ok(started) => {
+            // I-11: report when the graph was already live so callers (the
+            // smoke) cannot false-pass on a re-run.
+            Json(serde_json::json!({
+                "started": started,
+                "already_running": !started,
+                "graph": graph,
+                "workspace": ws
+            }))
+            .into_response()
+        }
         Err(e) => ApiError { error: e.to_string() }.into_response(),
     }
 }

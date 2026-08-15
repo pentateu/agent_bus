@@ -86,8 +86,51 @@ impl ManagerDecision {
                 }
             }
         }
+        // Regex fallback (§4.12 layered resolution, review I-9): a decision
+        // JSON object embedded in prose (e.g. fenced/markdown) still parses.
+        for message in messages.iter().rev() {
+            for part in &message.parts {
+                let Some(text) = &part.text else { continue };
+                for span in json_object_spans(text) {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(span)
+                        && let Some(decision) = Self::from_json(&value)
+                    {
+                        return Some(decision);
+                    }
+                }
+            }
+        }
         None
     }
+}
+
+/// Spans of balanced `{ ... }` in text (mirrors the ACK resolver's extraction).
+fn json_object_spans(text: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    for (i, ch) in text.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0
+                        && let Some(s) = start
+                    {
+                        spans.push(&text[s..=i]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
 }
 
 /// The manager client: ensures a manager session on the supervisor server and
@@ -155,16 +198,57 @@ impl ManagerClient {
         {
             self.client.prompt_async(&session, &prompt, Some("manager"), None).await?;
         }
-        // Wait briefly for the turn to finish, then read the decision.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        for _attempt in 0..3 {
+        // Wait for the turn to finish, reading the decision each round. The
+        // session-status map omits idle sessions, so the manager is idle once
+        // its id disappears — stop early then. A generous 60s cap covers a
+        // slow model (review I-9: the old 6s budget discarded correct
+        // decisions arriving at t=8s).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut saw_idle = false;
+        loop {
             let messages = self.client.messages(&session, 10).await?;
             if let Some(decision) = ManagerDecision::from_messages(&messages) {
                 return Ok(Some(decision));
             }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            let idle = self
+                .client
+                .session_status()
+                .await
+                .map(|status| !status.contains_key(&session))
+                .unwrap_or(false);
+            if idle {
+                saw_idle = true;
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         }
-        Ok(None)
+        if !saw_idle && tokio::time::Instant::now() >= deadline {
+            // The manager never went idle; give up rather than queue an
+            // unbounded follow-up. The escalation surfaces to the dashboard.
+            return Ok(None);
+        }
+        // One re-ask with a stricter instruction (I-9), then a final read.
+        // The manager is idle here (its previous turn ended), so this prompt
+        // gets a fresh turn.
+        let reask = format!(
+            "{prompt}\nIf your previous reply was not a valid JSON object, reply now with ONLY the JSON object and nothing else."
+        );
+        self.client.prompt_async(&session, &reask, Some("manager"), None).await?;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let messages = self.client.messages(&session, 10).await?;
+            if let Some(decision) = ManagerDecision::from_messages(&messages) {
+                return Ok(Some(decision));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        }
     }
 }
 

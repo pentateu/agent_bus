@@ -6,11 +6,26 @@
 /// Render the launchd plist for the supervisor daemon.
 ///
 /// `daemon_bin` is the absolute path to the `supervisor-daemon` binary;
-/// `state_dir` is `~/.supervisor` (expanded).
+/// `state_dir` is the resolved state dir. `state_dir_override` (the
+/// `SUPERVISOR_STATE_DIR` value, when set) is emitted as an
+/// `EnvironmentVariables` entry so the launched daemon uses the SAME state
+/// dir as the CLI that installed it (review I-13).
 #[must_use]
-pub fn render_plist(daemon_bin: &str, state_dir: &std::path::Path, label: &str) -> String {
+pub fn render_plist(
+    daemon_bin: &str,
+    state_dir: &std::path::Path,
+    label: &str,
+    state_dir_override: Option<&std::path::Path>,
+) -> String {
     let out_log = state_dir.join("logs").join("out.log");
     let err_log = state_dir.join("logs").join("err.log");
+    let env = match state_dir_override {
+        Some(dir) => format!(
+            "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>SUPERVISOR_STATE_DIR</key>\n\t\t<string>{}</string>\n\t</dict>\n",
+            dir.display()
+        ),
+        None => String::new(),
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -30,7 +45,7 @@ pub fn render_plist(daemon_bin: &str, state_dir: &std::path::Path, label: &str) 
 		<key>SuccessfulExit</key>
 		<false/>
 	</dict>
-	<key>StandardOutPath</key>
+{env}	<key>StandardOutPath</key>
 	<string>{out}</string>
 	<key>StandardErrorPath</key>
 	<string>{err}</string>
@@ -39,6 +54,7 @@ pub fn render_plist(daemon_bin: &str, state_dir: &std::path::Path, label: &str) 
 "#,
         label = label,
         daemon_bin = daemon_bin,
+        env = env,
         out = out_log.display(),
         err = err_log.display(),
     )
@@ -58,14 +74,19 @@ pub fn launch_agents_dir() -> std::path::PathBuf {
 ///
 /// # Errors
 /// Any I/O or `launchctl` failure.
-pub fn install(daemon_bin: &str, state_dir: &std::path::Path, label: &str) -> anyhow::Result<()> {
+pub fn install(
+    daemon_bin: &str,
+    state_dir: &std::path::Path,
+    label: &str,
+    state_dir_override: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     let dir = launch_agents_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow::anyhow!("creating {}: {e}", dir.display()))?;
     std::fs::create_dir_all(state_dir.join("logs"))
         .map_err(|e| anyhow::anyhow!("creating logs dir: {e}"))?;
     let path = dir.join(format!("{label}.plist"));
-    let plist = render_plist(daemon_bin, state_dir, label);
+    let plist = render_plist(daemon_bin, state_dir, label, state_dir_override);
     std::fs::write(&path, plist).map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
     // Load (ignore failure if already loaded).
     let _ = std::process::Command::new("launchctl")
@@ -81,12 +102,24 @@ mod tests {
     #[test]
     fn plist_contains_expected_keys() {
         let state = std::path::Path::new("/Users/u/.supervisor");
-        let plist = render_plist("/opt/bin/supervisor-daemon", state, DEFAULT_LABEL);
+        let plist = render_plist("/opt/bin/supervisor-daemon", state, DEFAULT_LABEL, None);
         assert!(plist.contains("<key>Label</key>"));
         assert!(plist.contains(DEFAULT_LABEL));
         assert!(plist.contains("/opt/bin/supervisor-daemon"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<key>SuccessfulExit</key>"));
         assert!(plist.contains("/Users/u/.supervisor/logs/out.log"));
+    }
+
+    #[test]
+    fn plist_emits_the_state_dir_override() {
+        // I-13: with SUPERVISOR_STATE_DIR set, the plist must pass it through
+        // so the launched daemon uses the same state dir as the CLI.
+        let state = std::path::Path::new("/Users/u/.supervisor");
+        let override_dir = std::path::Path::new("/tmp/sandbox/.supervisor");
+        let plist =
+            render_plist("/opt/bin/supervisor-daemon", state, DEFAULT_LABEL, Some(override_dir));
+        assert!(plist.contains("EnvironmentVariables"));
+        assert!(plist.contains("/tmp/sandbox/.supervisor"));
     }
 }

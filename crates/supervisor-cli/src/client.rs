@@ -79,7 +79,7 @@ impl ApiClient {
             .get(&url)
             .bearer_auth(&self.token)
             .send()
-            .map_err(|e| map_send_err(e, "GET {path}"))?;
+            .map_err(|e| map_send_err(&e, "GET {path}"))?;
         parse(res)
     }
 
@@ -89,13 +89,13 @@ impl ApiClient {
         if let Some(body) = body {
             req = req.json(body);
         }
-        parse(req.send().map_err(|e| map_send_err(e, "POST {path}"))?)
+        parse(req.send().map_err(|e| map_send_err(&e, "POST {path}"))?)
     }
 
     fn put(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         let url = format!("{}{path}", self.base);
         let req = self.http.put(&url).bearer_auth(&self.token).json(body);
-        parse(req.send().map_err(|e| map_send_err(e, "PUT {path}"))?)
+        parse(req.send().map_err(|e| map_send_err(&e, "PUT {path}"))?)
     }
 
     pub fn health(&self) -> Result<serde_json::Value> {
@@ -260,7 +260,7 @@ impl std::error::Error for TargetNotFound {}
 
 /// Map a reqwest send failure: a connect/timeout/request error means the
 /// daemon is unreachable (exit 3); anything else is a general failure.
-fn map_send_err(e: reqwest::Error, what: &str) -> anyhow::Error {
+fn map_send_err(e: &reqwest::Error, what: &str) -> anyhow::Error {
     if e.is_connect() || e.is_timeout() || e.is_request() {
         anyhow::Error::new(DaemonUnreachable(format!("{what}: {e}")))
     } else {

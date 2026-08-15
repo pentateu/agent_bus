@@ -48,7 +48,11 @@ return.
 **Daemon lifetime.** One daemon per OS user, auto-started by whichever command
 needs it first. Exits after **1.5 hours** with all partitions idle — deliberately
 above the retention window, so by the time it exits the logs hold nothing of
-value. Next command brings it back.
+value. Next command brings it back. **I-15 (recorded):** "idle" counts
+connected `wait`/`follow` subscribers as activity — a parked waiter or an
+open `follow` keeps the daemon alive until its subscription ends (a follow is
+unbounded by design). The daemon-side wait ceiling is `MAX_WAIT_TIMEOUT_SECS`
+(raised 5400 → 172800); the client clamps its own budget to the same ceiling.
 
 ## Architecture
 

@@ -242,10 +242,13 @@ RETENTION AND LIFECYCLE
 Messages are retained for 1 hour, then pruned. The bus is for coordination, not
 storage: anything that must outlive an hour belongs in a file or a commit.
 
-The daemon shuts itself down after 1.5 hours with no activity, and any command
-restarts it automatically. Cursors and message logs live on disk, so a restart
-loses nothing that has not aged out. You never need to start or stop it by
-hand, though `agent-bus stop` exists.
+The daemon shuts itself down after 1.5 hours with no activity — where
+"activity" counts connected waiters and follows, not just new posts (I-15):
+an agent blocked in `wait` (or following a stream) keeps the daemon alive
+until its subscription ends. Any command restarts it automatically. Cursors
+and message logs live on disk, so a restart loses nothing that has not aged
+out. You never need to start or stop it by hand, though `agent-bus stop`
+exists.
 
 
 EXIT CODES

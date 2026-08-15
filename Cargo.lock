@@ -24,7 +24,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "toml",
  "ulid",
 ]
 

@@ -258,7 +258,12 @@ reused.
   progress is visible at once.
 - **Decision log** (collapsed panel): recent decisions + proposals awaiting
   approval (`apply`/`reject` inline).
-- All live sections subscribe to the SSE store; nothing polls for state.
+- Live updates: agent state and workflow events arrive over SSE
+  (`/api/v1/events`); **node state is polled** (I-26 — the current workflow
+  events do not carry a `workspace_id`, so canvases read node states from
+  `GET /api/v1/graphs/{id}/nodes?ws=` every ~2s, workspace-scoped since I-1.
+  When workflow events gain `workspace_id`, the canvas can switch to SSE
+  attribution; until then the ~2s poll is the documented mechanism).
 
 ### 5.2 Workspace view (`/workspaces/:ws`)
 

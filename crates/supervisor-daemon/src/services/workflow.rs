@@ -267,11 +267,45 @@ impl WorkflowRunner {
 
     /// Handle a bus event.
     pub async fn handle(&self, event: BusEvent) {
-        if let BusEvent::Signal(signal) = event {
-            self.on_signal(signal).await;
+        match event {
+            BusEvent::Signal(signal) => self.on_signal(signal).await,
+            // A2: when an agent becomes idle/working (a session now exists) in
+            // a workspace, re-check nodes held on a missing role — if an agent
+            // with the role now exists, delivery proceeds.
+            BusEvent::Fleet(FleetEvent::AgentState {
+                workspace_id,
+                state:
+                    supervisor_core::types::AgentState::Idle
+                    | supervisor_core::types::AgentState::Working,
+                ..
+            }) => self.recheck_missing(&workspace_id).await,
+            _ => {}
         }
         // Workflow-related HumanEvent::Commands are routed by the command
         // dispatcher (F4) in `run()`; the old `start` stub is removed.
+    }
+
+    /// A2: for every node currently held on a missing role in `ws`, re-resolve
+    /// the role (a roster agent may have appeared). `on_ready` delivers if an
+    /// agent now matches; the hold stays if still absent.
+    async fn recheck_missing(&self, ws: &str) {
+        let held: Vec<(String, String)> = {
+            let fleet = self.fleet.lock().await;
+            fleet
+                .graphs()
+                .flat_map(|g| {
+                    fleet
+                        .node_states_all(&g.id)
+                        .filter(|r| r.workspace_id == ws && r.state == NodeState::MissingRole)
+                        .map(|r| (g.id.clone(), r.node_id.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        for (graph, node) in held {
+            tracing::info!(ws, graph, node, "rechecking missing-role node");
+            self.on_ready(ws, &graph, &node).await;
+        }
     }
 
     /// Route a scoped signal.
@@ -477,9 +511,13 @@ impl WorkflowRunner {
                     event: WorkflowEvent::MissingRole {
                         graph: graph.to_owned(),
                         node: node.to_owned(),
-                        role,
+                        role: role.clone(),
                     },
                 });
+                // A2: persist the surface marker directly (calling handle_event
+                // here would recurse into on_ready); the bus publish is for
+                // other consumers (web/SSE).
+                self.persist_node(ws, graph, node, NodeState::MissingRole).await;
                 return;
             }
         };
@@ -593,7 +631,14 @@ impl WorkflowRunner {
                 self.persist_node(ws, &graph, &node, NodeState::Ready).await;
                 self.on_ready(ws, &graph, &target).await;
             }
-            WorkflowEvent::Ack { .. } | WorkflowEvent::MissingRole { .. } => {}
+            WorkflowEvent::Ack { .. } => {}
+            // A2: persist the surface marker so triage/canvas can show the
+            // hold. The engine keeps the node at Ready; any later transition
+            // overwrites the row (clear-on-transition).
+            WorkflowEvent::MissingRole { graph, node, role } => {
+                tracing::info!(ws, graph, node, role, "node holds on a missing role");
+                self.persist_node(ws, &graph, &node, NodeState::MissingRole).await;
+            }
         }
     }
 
@@ -1035,5 +1080,101 @@ mod tests {
             "started_at must be stamped once and preserved"
         );
         assert_eq!(second.attempt, first.attempt, "attempt must not reset on every transition");
+    }
+
+    /// A2 fixtures: an `on` workspace with a single-role graph but no roster
+    /// agents.
+    async fn missing_role_fixture() -> (Arc<AsyncMutex<Fleet>>, Arc<WorkflowRunner>) {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet = Arc::new(AsyncMutex::new(Fleet::open(dir.path()).unwrap()));
+        let runner = test_runner(Arc::clone(&fleet));
+        {
+            let mut f = fleet.lock().await;
+            f.upsert_workspace(&supervisor_core::types::Workspace {
+                id: "iot".to_owned(),
+                path: "/x/iot".to_owned(),
+                port: Some(4101),
+                server_pid: None,
+                state: WorkspaceState::On,
+                cmux_ws: None,
+                layout_path: None,
+                updated_at: "t".to_owned(),
+            })
+            .unwrap();
+            f.upsert_graph(&supervisor_core::types::Graph {
+                id: "g".to_owned(),
+                name: "g".to_owned(),
+                data: r#"{"id":"g","name":"g","nodes":[
+                    {"id":"dev","role":"dev","start_template":"do it","done_when":{"ack":"dev"}}
+                ]}"#
+                .to_owned(),
+                version: 1,
+                active: true,
+                updated_at: "t".to_owned(),
+            })
+            .unwrap();
+        }
+        (fleet, runner)
+    }
+
+    #[tokio::test]
+    async fn missing_role_node_persists_the_marker_until_an_agent_appears() {
+        // A2: start with no dev agent → the node holds; the row is the
+        // MissingRole surface marker. Add an idle dev agent + fire the
+        // AgentState event → recheck resolves → delivery starts and the row
+        // becomes Running (clear-on-transition).
+        let (fleet, runner) = missing_role_fixture().await;
+        runner.start_graph("iot", "g", BTreeMap::new()).await.unwrap();
+        assert_eq!(
+            fleet.lock().await.node_state("iot", "g", "dev").unwrap().state,
+            NodeState::MissingRole,
+            "a node whose role has no agent persists the surface marker"
+        );
+
+        // The role now has an agent: recheck delivers.
+        {
+            let mut f = fleet.lock().await;
+            f.upsert_agent(&supervisor_core::types::Agent {
+                workspace_id: "iot".to_owned(),
+                agent_id: "dev_01".to_owned(),
+                role: "dev".to_owned(),
+                model: None,
+                session_id: Some("s1".to_owned()),
+                driver: supervisor_core::types::DriverKind::Opencode,
+                mode: supervisor_core::types::AgentMode::Foreground,
+                state: supervisor_core::types::AgentState::Idle,
+                confidence: 1.0,
+            })
+            .unwrap();
+        }
+        runner
+            .handle(BusEvent::Fleet(FleetEvent::AgentState {
+                workspace_id: "iot".to_owned(),
+                agent_id: "dev_01".to_owned(),
+                state: supervisor_core::types::AgentState::Idle,
+            }))
+            .await;
+        assert_eq!(
+            fleet.lock().await.node_state("iot", "g", "dev").unwrap().state,
+            NodeState::Running,
+            "an appearing agent clears the marker and starts delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_without_an_agent_keeps_the_hold() {
+        let (fleet, runner) = missing_role_fixture().await;
+        runner.start_graph("iot", "g", BTreeMap::new()).await.unwrap();
+        assert_eq!(
+            fleet.lock().await.node_state("iot", "g", "dev").unwrap().state,
+            NodeState::MissingRole
+        );
+        // No agent appears; a recheck must keep the hold.
+        runner.recheck_missing("iot").await;
+        assert_eq!(
+            fleet.lock().await.node_state("iot", "g", "dev").unwrap().state,
+            NodeState::MissingRole,
+            "the hold stays while the role is still unstaffed"
+        );
     }
 }

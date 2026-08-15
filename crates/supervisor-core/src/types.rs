@@ -111,6 +111,12 @@ pub enum NodeState {
     Failed,
     /// Completion is ambiguous; the manager or a human must rule.
     NeedsDecision,
+    /// **Surface marker only — the engine never sets it** (plan A2). The
+    /// engine holds the node at `Ready` when no roster agent has the node's
+    /// role (`dag.rs` `resolve_target`); the daemon persists this marker so
+    /// triage/canvas can show the hold. Any later transition overwrites it —
+    /// that is the clear path.
+    MissingRole,
 }
 
 /// The status an agent reports in its ACK contract.

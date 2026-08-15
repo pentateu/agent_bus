@@ -353,10 +353,13 @@ impl WorkflowRunner {
             if !consumed {
                 continue;
             }
-            self.bus.publish(BusEvent::Workflow(supervisor_core::dag::WorkflowEvent::Ack {
-                graph: graph.clone(),
-                ack: ack.clone(),
-            }));
+            self.bus.publish(BusEvent::Workflow {
+                workspace_id: ws.to_owned(),
+                event: supervisor_core::dag::WorkflowEvent::Ack {
+                    graph: graph.clone(),
+                    ack: ack.clone(),
+                },
+            });
             for event in events {
                 self.handle_event(ws, event).await;
             }
@@ -469,11 +472,14 @@ impl WorkflowRunner {
             RoleResolution::Target(agent_id) => agent_id,
             RoleResolution::MissingRole { role } => {
                 tracing::warn!(ws, graph, node, role, "node holds: no agent with this role");
-                self.bus.publish(BusEvent::Workflow(WorkflowEvent::MissingRole {
-                    graph: graph.to_owned(),
-                    node: node.to_owned(),
-                    role,
-                }));
+                self.bus.publish(BusEvent::Workflow {
+                    workspace_id: ws.to_owned(),
+                    event: WorkflowEvent::MissingRole {
+                        graph: graph.to_owned(),
+                        node: node.to_owned(),
+                        role,
+                    },
+                });
                 return;
             }
         };

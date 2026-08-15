@@ -19,8 +19,10 @@ use crate::types::{DecisionRecord, InboxEntry, Workspace, WorkspaceState};
 pub enum BusEvent {
     /// A raw external signal (SSE etc.). Not journaled.
     Signal(Signal),
-    /// A workflow engine event. Journaled.
-    Workflow(WorkflowEvent),
+    /// A workflow engine event, scoped to its workspace. Journaled.
+    /// The `workspace_id` is attached at the bus boundary — the engine's
+    /// [`WorkflowEvent`] has no workspace concept (plan A1).
+    Workflow { workspace_id: String, event: WorkflowEvent },
     /// An inbox mutation. Journaled.
     Inbox(InboxEvent),
     /// A fleet/workspace/agent state mutation. Journaled.
@@ -78,13 +80,23 @@ mod tests {
 
     #[test]
     fn bus_events_roundtrip_through_json() {
-        let e = BusEvent::Workflow(WorkflowEvent::NodeReady {
-            graph: "feature_lifecycle".to_owned(),
-            node: "dev".to_owned(),
-        });
+        let e = BusEvent::Workflow {
+            workspace_id: "iot".to_owned(),
+            event: WorkflowEvent::NodeReady {
+                graph: "feature_lifecycle".to_owned(),
+                node: "dev".to_owned(),
+            },
+        };
+        let json = serde_json::to_value(&e).unwrap();
+        assert_eq!(json["topic"], "workflow");
+        assert_eq!(json["workspace_id"], "iot");
         let back: BusEvent = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back, e);
-        assert!(matches!(back, BusEvent::Workflow(WorkflowEvent::NodeReady { .. })));
+        assert!(matches!(
+            back,
+            BusEvent::Workflow { workspace_id, event: WorkflowEvent::NodeReady { .. } }
+                if workspace_id == "iot"
+        ));
     }
 
     #[test]
@@ -129,16 +141,19 @@ mod tests {
     #[test]
     fn ack_events_roundtrip() {
         use crate::ack::Ack;
-        let e = BusEvent::Workflow(WorkflowEvent::Ack {
-            graph: "feature_lifecycle".to_owned(),
-            ack: Ack {
-                task_id: "dev".to_owned(),
-                status: crate::types::AckStatus::Done,
-                summary: None,
-                approved: None,
-                needs_revision: None,
+        let e = BusEvent::Workflow {
+            workspace_id: "iot".to_owned(),
+            event: WorkflowEvent::Ack {
+                graph: "feature_lifecycle".to_owned(),
+                ack: Ack {
+                    task_id: "dev".to_owned(),
+                    status: crate::types::AckStatus::Done,
+                    summary: None,
+                    approved: None,
+                    needs_revision: None,
+                },
             },
-        });
+        };
         let back: BusEvent = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back, e);
     }

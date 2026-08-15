@@ -75,9 +75,7 @@ fn a_parked_waiter_defers_idle_shutdown_until_it_times_out() {
             assert!(status.success(), "idle shutdown must exit 0, got {status}");
             break;
         }
-        if Instant::now() >= deadline {
-            panic!("daemon did not shut down after the waiter timed out");
-        }
+        assert!(Instant::now() < deadline, "daemon did not shut down after the waiter timed out");
         std::thread::sleep(Duration::from_millis(200));
     }
     let _ = child.kill();

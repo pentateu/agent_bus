@@ -133,6 +133,15 @@ pub enum DagAction {
     Status {
         id: Option<String>,
     },
+    /// A4: rule on a `NeedsDecision` node (`done` | `rerun` | `skip`).
+    Decide {
+        graph: String,
+        node: String,
+        #[arg(long)]
+        action: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 impl Cli {
@@ -596,6 +605,22 @@ fn dag(cli: &Cli, action: &DagAction) -> Result<()> {
             if !found && let Some(want) = id {
                 anyhow::bail!(crate::client::TargetNotFound(format!("unknown graph {want}")));
             }
+        }
+        DagAction::Decide { graph, node, action, reason } => {
+            // A4: resolve the workspace from the (workspace-scoped) node-state
+            // rows — a graph runs in at most one workspace. Unknown
+            // graph/node → exit 2; not needs-decision → exit 1.
+            let ws = {
+                let rows = client.graph_nodes(None, graph)?;
+                rows.iter()
+                    .find(|r| r["node_id"].as_str() == Some(node.as_str()))
+                    .and_then(|r| r["workspace_id"].as_str().map(str::to_owned))
+                    .ok_or_else(|| {
+                        crate::client::TargetNotFound(format!("unknown node {node:?} in {graph:?}"))
+                    })?
+            };
+            let result = client.decide_node(&ws, graph, node, action, reason.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
     }
     Ok(())

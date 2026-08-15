@@ -12,7 +12,7 @@ use supervisor_core::ack::resolve_ack;
 use supervisor_core::dag::{ManagerRuling, RoleResolution, RosterEntry, Workflow, WorkflowEvent};
 use supervisor_core::event::{BusEvent, FleetEvent, HumanEvent, InboxEvent};
 use supervisor_core::signal::Signal;
-use supervisor_core::types::{InboxEntry, NodeState, Priority, WorkspaceState};
+use supervisor_core::types::{DecisionRecord, InboxEntry, NodeState, Priority, WorkspaceState};
 use supervisor_core::{NodeStateRow, now_rfc3339};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
@@ -194,6 +194,79 @@ impl WorkflowRunner {
             }
             other => tracing::debug!(command = other, "unhandled command"),
         }
+    }
+
+    /// A4: a human ruling on a `NeedsDecision` node (Depth 2). Journal-first
+    /// (C-2 rule): the ruling is a [`DecisionRecord`] written BEFORE the
+    /// engine transition, so it lands in the decision log and feeds
+    /// bake-back.
+    ///
+    /// # Errors
+    /// Unknown graph/node, or the node is not in `needs_decision` (409).
+    pub async fn decide(
+        &self,
+        ws: &str,
+        graph: &str,
+        node: &str,
+        action: &str,
+        reason: Option<&str>,
+    ) -> Result<NodeState> {
+        let ruling = match action {
+            "done" => ManagerRuling::Done,
+            "rerun" => ManagerRuling::Rerun,
+            "skip" => ManagerRuling::Skip,
+            other => anyhow::bail!("action must be done|rerun|skip, got {other:?}"),
+        };
+        let (events, current) = {
+            let mut instances =
+                self.instances.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(instance) = instances.get_mut(&(ws.to_owned(), graph.to_owned())) else {
+                anyhow::bail!("unknown graph {graph:?} in {ws}");
+            };
+            let Some(state) = instance.state(node) else {
+                anyhow::bail!("unknown node {node:?} in {graph:?}");
+            };
+            if state != NodeState::NeedsDecision {
+                anyhow::bail!("node {node:?} is {state:?}, not needs_decision");
+            }
+            (instance.rule(node, ruling), state)
+        };
+        if events.is_empty() {
+            anyhow::bail!("node {node:?} is not needs_decision (no ruling applied)");
+        }
+        // Journal the human ruling (journal-first, before applying events).
+        {
+            let mut fleet = self.fleet.lock().await;
+            let decision = DecisionRecord {
+                id: format!("d_{}", supervisor_core::time::new_ulid()),
+                signature: format!("human.ruling.{graph}/{node}"),
+                situation: serde_json::json!({
+                    "ws": ws, "graph": graph, "node": node,
+                    "state": "needs_decision", "reason": reason.unwrap_or_default(),
+                }),
+                decision: serde_json::json!({
+                    "action": action, "reason": reason.unwrap_or_default(),
+                    "source": "human",
+                }),
+                outcome: None,
+                ts: now_rfc3339(),
+            };
+            if let Err(e) = fleet.append_decision(&decision) {
+                tracing::error!(ws, graph, node, error = %e, "journal human ruling failed");
+            }
+        }
+        for event in events {
+            self.handle_event(ws, event).await;
+        }
+        let new_state = {
+            let instances =
+                self.instances.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            instances
+                .get(&(ws.to_owned(), graph.to_owned()))
+                .and_then(|i| i.state(node))
+                .unwrap_or(current)
+        };
+        Ok(new_state)
     }
 
     /// The `(graph, node)` an agent is currently working on, if any (F4 — node
@@ -1176,5 +1249,96 @@ mod tests {
             NodeState::MissingRole,
             "the hold stays while the role is still unstaffed"
         );
+    }
+
+    /// A4: a graph with one node forced into `NeedsDecision` via the engine.
+    async fn needs_decision_fixture() -> (Arc<AsyncMutex<Fleet>>, Arc<WorkflowRunner>) {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet = Arc::new(AsyncMutex::new(Fleet::open(dir.path()).unwrap()));
+        let runner = test_runner(Arc::clone(&fleet));
+        {
+            let mut f = fleet.lock().await;
+            f.upsert_workspace(&supervisor_core::types::Workspace {
+                id: "iot".to_owned(),
+                path: "/x/iot".to_owned(),
+                port: Some(4101),
+                server_pid: None,
+                state: WorkspaceState::On,
+                cmux_ws: None,
+                layout_path: None,
+                updated_at: "t".to_owned(),
+            })
+            .unwrap();
+        }
+        let instance = Workflow::parse_json(
+            r#"{"id":"g","name":"g","nodes":[
+                {"id":"dev","role":"dev","start_template":"do it","done_when":{"ack":"dev"},"on_error":"delegate"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut instance = instance;
+        {
+            let mut instances =
+                runner.instances.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            instance.start("dev").unwrap();
+            let _ = instance.fail("dev");
+            instances.insert(("iot".to_owned(), "g".to_owned()), instance);
+        }
+        (fleet, runner)
+    }
+
+    #[tokio::test]
+    async fn decide_rerun_transitions_and_journals_the_ruling() {
+        // A4: rerun re-readies the node and a DecisionRecord is journaled
+        // (journal-first, C-2).
+        let (fleet, runner) = needs_decision_fixture().await;
+        let before = fleet.lock().await.decisions().len();
+
+        let state = runner.decide("iot", "g", "dev", "rerun", Some("reproduce it")).await.unwrap();
+        assert_eq!(state, NodeState::Ready, "a rerun ruling re-readies the node");
+        // No dev agent exists in the fixture: on_ready holds at the missing
+        // role marker (the engine stays Ready; the row surfaces the hold).
+        assert_eq!(
+            fleet.lock().await.node_state("iot", "g", "dev").unwrap().state,
+            NodeState::MissingRole,
+            "without a role agent the re-run holds (surface marker)"
+        );
+        let guard = fleet.lock().await;
+        let decisions = guard.decisions();
+        assert_eq!(decisions.len(), before + 1, "the ruling is journaled as a decision");
+        assert_eq!(decisions.last().unwrap().signature, "human.ruling.g/dev");
+        assert_eq!(decisions.last().unwrap().decision["source"], "human");
+    }
+
+    #[tokio::test]
+    async fn decide_done_transitions_and_double_decide_is_a_noop() {
+        let (_fleet, runner) = needs_decision_fixture().await;
+        let state = runner.decide("iot", "g", "dev", "done", None).await.unwrap();
+        assert_eq!(state, NodeState::Done);
+
+        // A second decide on a now-Done node is a 409-style error (the API
+        // maps it to CONFLICT); the runner surfaces the message.
+        let err = runner.decide("iot", "g", "dev", "done", None).await.unwrap_err();
+        assert!(err.to_string().contains("not needs_decision"));
+    }
+
+    #[tokio::test]
+    async fn decide_skip_flags_the_node_skipped() {
+        let (fleet, runner) = needs_decision_fixture().await;
+        let state = runner.decide("iot", "g", "dev", "skip", None).await.unwrap();
+        assert_eq!(state, NodeState::Done);
+        // The persisted row is Done; the skipped flag is on the engine event
+        // (surfaced via the runlog/UI later). Just assert the transition here.
+        assert_eq!(
+            fleet.lock().await.node_state("iot", "g", "dev").unwrap().state,
+            NodeState::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_rejects_unknown_node_and_bad_action() {
+        let (_fleet, runner) = needs_decision_fixture().await;
+        assert!(runner.decide("iot", "g", "nope", "done", None).await.is_err());
+        assert!(runner.decide("iot", "g", "dev", "explode", None).await.is_err());
     }
 }

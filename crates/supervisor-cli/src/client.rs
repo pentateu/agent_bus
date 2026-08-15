@@ -206,6 +206,25 @@ impl ApiClient {
         serde_json::from_value(value).context("decode graph nodes")
     }
 
+    /// A4: rule on a `NeedsDecision` node.
+    pub fn decide_node(
+        &self,
+        ws: &str,
+        graph: &str,
+        node: &str,
+        action: &str,
+        reason: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let mut body = serde_json::json!({ "action": action });
+        if let Some(reason) = reason {
+            body["reason"] = serde_json::json!(reason);
+        }
+        self.post(
+            &format!("/api/v1/workspaces/{ws}/graphs/{graph}/nodes/{node}/decide"),
+            Some(&body),
+        )
+    }
+
     pub fn attach(&self, ws: &str, agent: &str) -> Result<serde_json::Value> {
         self.post(&format!("/api/v1/workspaces/{ws}/agents/{agent}/attach"), None)
     }

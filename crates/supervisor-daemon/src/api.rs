@@ -85,6 +85,7 @@ pub fn router(state: &ApiState) -> Router {
         .route("/api/v1/graphs/{id}", get(get_graph).put(put_graph).delete(delete_graph))
         .route("/api/v1/graphs/{id}/nodes", get(get_graph_nodes))
         .route("/api/v1/workspaces/{ws}/graphs/{graph}/start", post(start_workflow))
+        .route("/api/v1/workspaces/{ws}/graphs/{graph}/nodes/{node}/decide", post(decide_node))
         .route("/api/v1/rules", get(list_rules).post(add_rule))
         .route("/api/v1/rules/reload", post(reload_rules))
         .route("/api/v1/decision-log", get(decision_log))
@@ -590,6 +591,45 @@ async fn start_workflow(
             .into_response()
         }
         Err(e) => ApiError { error: e.to_string() }.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct DecideBody {
+    /// `done` | `rerun` | `skip`.
+    action: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// A4: `POST /api/v1/workspaces/{ws}/graphs/{graph}/nodes/{node}/decide` —
+/// a human ruling on a `NeedsDecision` node. Journaled as a decision record
+/// before the engine transition (C-2).
+async fn decide_node(
+    State(state): State<ApiState>,
+    Path((ws, graph, node)): Path<(String, String, String)>,
+    Json(body): Json<DecideBody>,
+) -> Response {
+    match state.workflows.decide(&ws, &graph, &node, &body.action, body.reason.as_deref()).await {
+        Ok(new_state) => Json(serde_json::json!({
+            "node": node,
+            "state": new_state,
+            "action": body.action,
+            "workspace": ws,
+            "graph": graph,
+        }))
+        .into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("not needs_decision") {
+                StatusCode::CONFLICT
+            } else if msg.contains("unknown") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(ApiError { error: msg })).into_response()
+        }
     }
 }
 

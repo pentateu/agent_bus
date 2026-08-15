@@ -37,13 +37,15 @@ pub fn run(pattern: &str, label: &str, timeout_secs: Option<u64>, json: bool) ->
 
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() && last_error.is_some() {
+        if remaining.is_zero()
+            && let Some(last) = last_error.take()
+        {
             // Tried and the daemon never answered within the budget: surface
             // whatever was most recently wrong (exit 3 for unavailability).
             // A fresh `--timeout 0` has no error yet and must still ask the
             // daemon once (I-17: it returns Timeout → exit 2, matching the
             // documented "nothing pending" contract).
-            return Err(last_error.unwrap());
+            return Err(last);
         }
 
         let response = match Client::connect().and_then(|mut client| {

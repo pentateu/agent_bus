@@ -117,14 +117,12 @@ fn json_object_spans(text: &str) -> Vec<&str> {
                 }
                 depth += 1;
             }
-            '}' => {
-                if depth > 0 {
-                    depth -= 1;
-                    if depth == 0
-                        && let Some(s) = start
-                    {
-                        spans.push(&text[s..=i]);
-                    }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0
+                    && let Some(s) = start
+                {
+                    spans.push(&text[s..=i]);
                 }
             }
             _ => {}
@@ -203,7 +201,7 @@ impl ManagerClient {
         // its id disappears — stop early then. A generous 60s cap covers a
         // slow model (review I-9: the old 6s budget discarded correct
         // decisions arriving at t=8s).
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
         let mut saw_idle = false;
         loop {
             let messages = self.client.messages(&session, 10).await?;
@@ -217,8 +215,7 @@ impl ManagerClient {
                 .client
                 .session_status()
                 .await
-                .map(|status| !status.contains_key(&session))
-                .unwrap_or(false);
+                .is_ok_and(|status| !status.contains_key(&session));
             if idle {
                 saw_idle = true;
                 break;

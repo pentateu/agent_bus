@@ -4,25 +4,21 @@
 > software spec yet.
 > **Status:** designed (iterating). Ledger: `docs/ledger.md` →
 > `plan_high_level_2026-08_webui-polish-e2e`.
-> **Sibling:** [`plan_high_level_2026-08_webui-polish-e2e.md`](plan_high_level_2026-08_webui-polish-e2e.md)
+> **Sibling:** [`plan_high_level_2026-08_supervisor-webui-i31.md`](plan_high_level_2026-08_supervisor-webui-i31.md) — owns the I-31 feature set (intake/rules pages + property panel moved there, 2026-08-15).
 > **Product:** the supervisor web UI in `web/` (Vite + React + TS), served by
 > `supervisor-daemon` at `http://127.0.0.1:4198/ui/`.
 > **System hub:** [`docs/specs/2026-08-14-supervisor-webui-detailed-design.md`](../specs/2026-08-14-supervisor-webui-detailed-design.md)
 > **Detail software design:** `docs/plans/plan_2026-08_webui-polish-e2e.md` (not yet written)
 >
-> Last updated: 2026-08-14.
+> Last updated: 2026-08-15.
 
 ## Requirements (locked)
 
-1. Fix the live stream. The SPA must receive SSE events from the daemon.
-   Today it does not: `web/src/api/sse.ts:60` fetches `/api/v1/events` without
-   the `Authorization` header, and `crates/supervisor-daemon/src/api.rs:99`
-   puts every `/api/v1/*` route behind bearer auth. The live dashboard, the
-   canvas animations, and the agent dialog all depend on this one fix.
-2. Add the two missing pages: intake and rules. Backend endpoints exist
-   (`GET /api/v1/intake` at `api.rs:95`, `GET/POST /api/v1/rules` +
-   `POST /rules/reload` at `api.rs:85-86`). The SPA has no page for either
-   (`web/src/pages/` holds only Agent, Dashboard, Decisions, Graphs).
+1. ~~Fix the live stream.~~ **Landed** — `web/src/api/sse.ts:73` sends the
+   Bearer header; the fetch-stream SSE parser + abortable reconnect are in
+   place (I-24/I-25 fixes). No work left here.
+2. ~~Add the two missing pages: intake and rules.~~ **Moved** to the I-31 plan
+   (`plan_high_level_2026-08_supervisor-webui-i31.md`, R10) — 2026-08-15.
 3. Ship a Playwright e2e suite per the spec's test list (§7 of the web-UI
    spec): dashboard render + live SSE update, live mini-canvas animate +
    green-on-ACK, editor add/wire/edit/save/re-open, agent dialog message echo
@@ -30,8 +26,11 @@
    (`web/package.json` has vitest only; no `web/e2e/`, no `playwright.config.*`).
 4. Run an accessibility pass: roles/aria on canvas nodes and controls,
    non-color state cues, `aria-live` on the transcript. The spec's U6
-   milestone names it; nothing exists today (no `aria-*`, `role`, or
-   `data-testid` in `web/src`).
+   milestone names it; today only tablist/tab roles and three
+   `role="alert"` banners exist (`Dashboard.tsx:100,114-119`,
+   `Agent.tsx:75`, `Graphs.tsx:62`) — canvas nodes, icon-only buttons, and
+   the transcript have no roles or labels, and there are no `data-testid`
+   anywhere.
 5. Keep verification green: `cargo test --workspace`, `cargo clippy
    --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`,
    `cd web && npm run test && npm run build`. E2E must run headless in CI
@@ -41,11 +40,11 @@
 
 | Surface | Current | Target |
 |---|---|---|
-| SSE live feed | 401 — never connects (`sse.ts:60` vs `api.rs:99`) | Bearer header on the fetch-stream; dashboard + canvases animate |
-| Pages | dashboard, graphs, decisions, agent dialog | + intake list, + rules list/add/reload |
+| SSE live feed | landed (`sse.ts:73` bearer header; I-24 abort, I-25 401) | nothing to do |
+| Pages | dashboard, graphs, decisions, agent dialog | intake + rules pages moved to the I-31 plan (R10) |
 | E2E | none | Playwright suite in `web/e2e/`, seeded via the API, runs headless |
-| a11y | none (`aria-*`, `role`, `data-testid` absent) | roles + labels on controls, non-color state cues, `aria-live` transcript |
-| Editor property panel | role, start_template, done_when.ack, mode only (`web/src/pages/Graphs.tsx:89-117`) | full §5.3 panel: agent_id, on_error, gate, loop_back, timeout_secs, done_when approved/match |
+| a11y | minimal (tablist/tab roles, three `role="alert"`; no node/control labels, no `aria-live`) | roles + labels on controls, non-color state cues, `aria-live` transcript |
+| Editor property panel | role, start_template, done_when.ack, mode only (`web/src/pages/Graphs.tsx:89-117`) | full §5.3 panel moved to the I-31 plan (R9) |
 | Failure states | bare `—`/empty, react-query errors unhandled | error surface per page; empty-state copy |
 
 ## Design
@@ -58,17 +57,10 @@ fetch-stream request, mirroring `web/src/api/client.ts:35-45`. No backend
 change. This is the spine of U6 — the e2e `@live` tests and the polish both
 sit on top of it. Do it first.
 
-### 2. Intake + Rules pages
+### 2. Intake + Rules pages — moved
 
-Both pages are thin read/write surfaces over existing endpoints, following the
-existing `useQuery`/`useMutation` pattern in `pages/Decisions.tsx`.
-
-- **Intake** (`/intake`): list `GET /api/v1/intake` rows; show kind, title,
-  severity, linked `graph_id`, `received_at`; link the graph id to the graph
-  page.
-- **Rules** (`/rules`): list `GET /api/v1/rules`; TOML textarea add
-  (`POST /api/v1/rules`) + reload button (`POST /rules/reload`) per §5.5.
-- Nav entries in `web/src/app.tsx`; routes in `parseRoute`.
+Moved to the I-31 plan (`plan_high_level_2026-08_supervisor-webui-i31.md`,
+R10 + detailed design §7.6). This plan no longer builds pages.
 
 ### 3. Playwright e2e suite
 
@@ -114,18 +106,19 @@ existing `useQuery`/`useMutation` pattern in `pages/Decisions.tsx`.
 - Focus management for the editor property panel; `alt`/hidden on decorative
   glyphs. Asserted by the e2e `@critical` a11y checks, not just eyeballed.
 
-### 5. Editor property panel completion + failure states
+### 5. Editor property panel — moved
 
-- Extend `web/src/pages/Graphs.tsx` properties panel to the full node field
-  set per §5.3 (agent_id, on_error select, gate, loop_back small/big,
-  timeout_secs, done_when approved/match), reusing `lib/graph-edit.ts` pure
-  helpers.
+Moved to the I-31 plan (`plan_high_level_2026-08_supervisor-webui-i31.md`,
+R9 + detailed design §7.6).
+
 - A small shared error/empty surface (react-query error state is currently
   unhandled across all pages) so failures render a message, not silence.
 
 ## Boundaries
 
-- **In:** the five polish items + the e2e harness + suite, in `web/` only.
+- **In:** the remaining polish items (a11y, error/empty states) + the e2e
+  harness + suite, in `web/` only. Intake/rules pages and the property panel
+  live in the I-31 plan.
 - **Out:** backend changes (all endpoints needed already exist; if an e2e test
   surfaces a backend bug, that is a finding to the dev, not a test edit).
 - **Out:** the live `opencode serve` chain itself — `supervisor smoke` already
@@ -148,17 +141,18 @@ existing `useQuery`/`useMutation` pattern in `pages/Decisions.tsx`.
 
 ## Implementation sketch (after lock)
 
-1. SSE bearer fix (`sse.ts`) — spine; verify live in dev.
+1. ~~SSE bearer fix (`sse.ts`)~~ — landed.
 2. Playwright harness + config + `run-e2e.sh` + API seeding (foundation for
    every e2e task).
 3. `@smoke` static tests: dashboard render, missing-token gate, graphs list.
-4. Intake + Rules pages (polish surfaces double as e2e targets).
-5. Accessibility pass + a11y assertions in the suite.
-6. `@live` canvas + agent-dialog tests (gated on the chain / fake driver).
-7. Editor property panel completion + failure-state surface.
+4. Accessibility pass + a11y assertions in the suite + the shared
+   error/empty surface.
+5. `@live` canvas + agent-dialog tests (gated on the chain / fake driver).
 
 ## Related
 
+- I-31 plan (owns intake/rules/property panel now):
+  [`docs/plans/plan_high_level_2026-08_supervisor-webui-i31.md`](plan_high_level_2026-08_supervisor-webui-i31.md)
 - Spec: [`docs/specs/2026-08-14-supervisor-webui-detailed-design.md`](../specs/2026-08-14-supervisor-webui-detailed-design.md) (§7 e2e list, §8 U6 milestone, §5 pages).
 - Tester contract: [`docs/agents/tester.md`](../agents/tester.md).
 - Verification bar: [`docs/agents/dev-orchestrator.md`](../agents/dev-orchestrator.md).

@@ -40,7 +40,10 @@ export const api = {
 
   graphs: () => get<GraphRecord[]>("/api/v1/graphs"),
   graph: (id: string) => get<GraphRecord>(`/api/v1/graphs/${encodeURIComponent(id)}`),
-  graphNodes: (id: string) => get<NodeStateRow[]>(`/api/v1/graphs/${encodeURIComponent(id)}/nodes`),
+  graphNodes: (ws: string | undefined, id: string) =>
+    get<NodeStateRow[]>(
+      `/api/v1/graphs/${encodeURIComponent(id)}/nodes${ws ? `?ws=${encodeURIComponent(ws)}` : ""}`,
+    ),
   saveGraph: (id: string, data: string) => put(`/api/v1/graphs/${encodeURIComponent(id)}`, { data }),
   startGraph: (ws: string, graph: string, vars: Record<string, string> = {}) =>
     post(`/api/v1/workspaces/${encodeURIComponent(ws)}/graphs/${encodeURIComponent(graph)}/start`, { vars }),

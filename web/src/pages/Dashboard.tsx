@@ -17,10 +17,10 @@ function Metric({ label, value, est }: { label: string; value: string; est?: boo
   );
 }
 
-function useGraphNodeStates(graphId: string): Record<string, NodeState> {
+function useGraphNodeStates(ws: string, graphId: string): Record<string, NodeState> {
   const { data } = useQuery({
-    queryKey: ["graphNodes", graphId],
-    queryFn: () => api.graphNodes(graphId),
+    queryKey: ["graphNodes", ws, graphId],
+    queryFn: () => api.graphNodes(ws, graphId),
     refetchInterval: 2000,
   });
   return (data ?? []).reduce<Record<string, NodeState>>((acc, row) => {
@@ -33,7 +33,7 @@ function useGraphNodeStates(graphId: string): Record<string, NodeState> {
  * per workspace at a time (the workspace card tabs between them). */
 function LiveGraph({ ws, graph, agents }: { ws: string; graph: GraphRecord; agents: Agent[] }) {
   const live = useLive();
-  const nodeStates = useGraphNodeStates(graph.id);
+  const nodeStates = useGraphNodeStates(ws, graph.id);
   const parsed = parseGraph(graph.data);
   const agentStates = agents.reduce<Record<string, import("../api/types").AgentState>>((acc, a) => {
     acc[a.agent_id] = live.agentStates[ws]?.[a.agent_id] ?? a.state;

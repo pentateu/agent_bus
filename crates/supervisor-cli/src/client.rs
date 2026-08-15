@@ -196,8 +196,13 @@ impl ApiClient {
         self.put(&format!("/api/v1/graphs/{id}"), &serde_json::json!({ "data": data }))
     }
 
-    pub fn graph_nodes(&self, id: &str) -> Result<Vec<serde_json::Value>> {
-        let value = self.get(&format!("/api/v1/graphs/{id}/nodes"))?;
+    pub fn graph_nodes(&self, ws: Option<&str>, id: &str) -> Result<Vec<serde_json::Value>> {
+        // I-1: node state is workspace-scoped; `ws` filters, absent = all.
+        let path = match ws {
+            Some(ws) => format!("/api/v1/graphs/{id}/nodes?ws={ws}"),
+            None => format!("/api/v1/graphs/{id}/nodes"),
+        };
+        let value = self.get(&path)?;
         serde_json::from_value(value).context("decode graph nodes")
     }
 

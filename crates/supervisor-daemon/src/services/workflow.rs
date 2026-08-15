@@ -117,7 +117,10 @@ impl WorkflowRunner {
             };
             let states = {
                 let fleet = self.fleet.lock().await;
-                fleet.node_states(&graph).map(|r| (r.node_id.clone(), r.state)).collect::<Vec<_>>()
+                fleet
+                    .node_states(&ws, &graph)
+                    .map(|r| (r.node_id.clone(), r.state))
+                    .collect::<Vec<_>>()
             };
             instance.restore_states(states);
             {
@@ -218,19 +221,18 @@ impl WorkflowRunner {
         graph_id: &str,
         vars: BTreeMap<String, String>,
     ) -> Result<()> {
-        // M3 dedupe: never start twice while an instance is live.
+        // M3 dedupe: never start twice while an instance is live. The check
+        // and the insert share one lock hold (review I-3): pre-loading the
+        // instance keeps the atomicity, so two concurrent starts cannot both
+        // pass the guard — the loser sees the entry and no-ops.
+        let instance = self.load_instance(graph_id).await?;
         {
-            let instances =
+            let mut instances =
                 self.instances.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if instances.contains_key(&(ws.to_owned(), graph_id.to_owned())) {
                 tracing::debug!(ws, graph = graph_id, "graph already running; no-op");
                 return Ok(());
             }
-        }
-        let instance = self.load_instance(graph_id).await?;
-        {
-            let mut instances =
-                self.instances.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             instances.insert((ws.to_owned(), graph_id.to_owned()), instance.clone());
         }
         // Journal the start before publishing readiness (M3).
@@ -317,15 +319,17 @@ impl WorkflowRunner {
             return;
         };
         tracing::info!(ws, agent, task = %ack.task_id, status = ?ack.status, "ack resolved; advancing node");
-        // Publish + apply to every distinct graph holding a running node
-        // (one agent may carry nodes from several workflows).
-        let graphs: std::collections::BTreeSet<String> =
-            tasks.iter().map(|(g, _)| g.clone()).collect();
+        // Apply to the most recently started matching task only (review I-4):
+        // one turn belongs to one task, and a bare task_id must not complete
+        // nodes with the same ack string in a different workflow. The first
+        // graph (most recent task) that actually consumes the ack wins.
+        let mut graphs: Vec<String> = Vec::new();
+        for (g, _) in tasks.iter().rev() {
+            if !graphs.contains(g) {
+                graphs.push(g.clone());
+            }
+        }
         for graph in graphs {
-            self.bus.publish(BusEvent::Workflow(supervisor_core::dag::WorkflowEvent::Ack {
-                graph: graph.clone(),
-                ack: ack.clone(),
-            }));
             let events = {
                 let mut instances =
                     self.instances.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -334,9 +338,27 @@ impl WorkflowRunner {
                 };
                 instance.apply_ack(&ack)
             };
+            let consumed = events.iter().any(|e| {
+                matches!(
+                    e,
+                    supervisor_core::dag::WorkflowEvent::NodeDone { .. }
+                        | supervisor_core::dag::WorkflowEvent::NodeFailed { .. }
+                        | supervisor_core::dag::WorkflowEvent::NodeBlocked { .. }
+                        | supervisor_core::dag::WorkflowEvent::NodeNeedsDecision { .. }
+                        | supervisor_core::dag::WorkflowEvent::LoopBack { .. }
+                )
+            });
+            if !consumed {
+                continue;
+            }
+            self.bus.publish(BusEvent::Workflow(supervisor_core::dag::WorkflowEvent::Ack {
+                graph: graph.clone(),
+                ack: ack.clone(),
+            }));
             for event in events {
                 self.handle_event(ws, event).await;
             }
+            break;
         }
     }
 
@@ -566,12 +588,13 @@ impl WorkflowRunner {
     async fn persist_node(&self, ws: &str, graph: &str, node: &str, state: NodeState) {
         let (existing_started_at, existing_attempt) = {
             let fleet = self.fleet.lock().await;
-            match fleet.node_state(graph, node) {
+            match fleet.node_state(ws, graph, node) {
                 Some(row) => (row.started_at.clone(), row.attempt),
                 None => (None, 0),
             }
         };
         let row = NodeStateRow {
+            workspace_id: ws.to_owned(),
             graph_id: graph.to_owned(),
             node_id: node.to_owned(),
             state,
@@ -987,10 +1010,10 @@ mod tests {
         let fleet = Arc::new(AsyncMutex::new(Fleet::open(dir.path()).unwrap()));
         let runner = test_runner(Arc::clone(&fleet));
         runner.persist_node("iot", "g", "dev", NodeState::Running).await;
-        let first = fleet.lock().await.node_state("g", "dev").cloned().unwrap();
+        let first = fleet.lock().await.node_state("iot", "g", "dev").cloned().unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         runner.persist_node("iot", "g", "dev", NodeState::Done).await;
-        let second = fleet.lock().await.node_state("g", "dev").cloned().unwrap();
+        let second = fleet.lock().await.node_state("iot", "g", "dev").cloned().unwrap();
         assert_eq!(
             second.started_at, first.started_at,
             "started_at must be stamped once and preserved"

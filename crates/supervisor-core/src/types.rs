@@ -385,6 +385,11 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeStateRow {
+    /// I-1 (review): node state is keyed per workspace — two workspaces
+    /// running the same graph must not corrupt each other's rows. `default`
+    /// keeps pre-I-1 journal records replayable.
+    #[serde(default)]
+    pub workspace_id: String,
     pub graph_id: String,
     pub node_id: String,
     #[serde(default)]

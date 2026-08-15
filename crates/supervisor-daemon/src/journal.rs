@@ -8,6 +8,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -37,11 +38,17 @@ impl Journal {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating journal dir {}", parent.display()))?;
         }
+        // I-32: journal lines contain pasted secrets (inbox bodies); the file
+        // must be 0600, not the default umask 0644.
         let file = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(path)
             .with_context(|| format!("opening journal {}", path.display()))?;
+        if let Ok(metadata) = file.metadata() {
+            metadata.permissions().set_mode(0o600);
+        }
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("reading journal {}", path.display()))?;
         let next_seq =

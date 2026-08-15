@@ -62,6 +62,9 @@ pub struct WorkspaceManager {
     secret: String,
     shutdown: CancellationToken,
     children: Mutex<HashMap<String, ServerChild>>,
+    /// I-2: per-workspace lifecycle lock — `on`/`off` must not interleave (a
+    /// stale `on()` could flip a drained workspace back to On mid-teardown).
+    transitions: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     allocator: Mutex<PortAllocator>,
     observers: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// M7: `session_id → (ws, agent)` for the SSE resolver (no async lock in
@@ -96,6 +99,7 @@ impl WorkspaceManager {
             secret: deps.secret,
             shutdown: deps.shutdown,
             children: Mutex::new(HashMap::new()),
+            transitions: tokio::sync::Mutex::new(HashMap::new()),
             allocator: Mutex::new(deps.allocator),
             observers: Mutex::new(HashMap::new()),
             session_index: Mutex::new(HashMap::new()),
@@ -110,11 +114,65 @@ impl WorkspaceManager {
         fleet.workspace(ws_id).is_some_and(|w| w.state == WorkspaceState::On)
     }
 
+    /// The per-workspace lifecycle lock (I-2): serializes `on`/`off` for a
+    /// workspace so a stale `on()` cannot interleave with a teardown.
+    async fn lifecycle_guard(&self, ws_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let slot = self.transitions.lock().await.entry(ws_id.to_owned()).or_default().clone();
+        slot.lock_owned().await
+    }
+
+    /// Bring up the workspace's opencode server on `port`, returning the port
+    /// actually used (review I-7 / adopt-or-kill):
+    /// - Recorded workspace: the port is ours by contract (session ids stay
+    ///   valid) — kill the occupant and respawn on the same port.
+    /// - First-time workspace: probe, never kill a stranger. If the
+    ///   fixed/allocated port is occupied by an unrelated process, free it and
+    ///   take the next free port.
+    async fn ensure_server(
+        &self,
+        ws_id: &str,
+        project: &str,
+        recorded: Option<u16>,
+        port: u16,
+    ) -> Result<u16> {
+        if recorded.is_some() {
+            self.release_port_occupant(port).await;
+            self.spawn_server(ws_id, project, port).await?;
+            return Ok(port);
+        }
+        let chosen = if probe_port(port).await {
+            port
+        } else {
+            tracing::warn!(
+                port,
+                ws = ws_id,
+                "port held by an unrelated process; allocating another"
+            );
+            self.allocator.lock().unwrap_or_else(std::sync::PoisonError::into_inner).free(port);
+            loop {
+                let next = self
+                    .allocator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .alloc()
+                    .context("no free ports in the configured range")?;
+                if probe_port(next).await {
+                    break next;
+                }
+                self.allocator.lock().unwrap_or_else(std::sync::PoisonError::into_inner).free(next);
+            }
+        };
+        self.spawn_server(ws_id, project, chosen).await?;
+        Ok(chosen)
+    }
+
     /// Idempotent bring-up (§4.3 `on`).
     ///
     /// # Errors
     /// Any failure to configure, spawn, or attach the workspace.
     pub async fn on(&self, ws_id: &str) -> Result<()> {
+        // I-2: serialize per-workspace so `on`/`off` cannot interleave.
+        let _lifecycle = self.lifecycle_guard(ws_id).await;
         let workspace = {
             let fleet = self.fleet.lock().await;
             fleet.workspace(ws_id).cloned().context("workspace not registered")?
@@ -165,7 +223,7 @@ impl WorkspaceManager {
         // Determine the port: a recorded port is never switched (adopt-or-kill);
         // otherwise the config's fixed port or the allocator.
         let recorded = workspace.recorded_port();
-        let port = match recorded {
+        let mut port = match recorded {
             Some(p) => p,
             None => config
                 .fixed_port()
@@ -186,10 +244,7 @@ impl WorkspaceManager {
         };
 
         if decision == AdoptOrKill::Kill {
-            // Free the port for our own bind: kill any occupant, then respawn
-            // on the same port.
-            self.release_port_occupant(port).await;
-            self.spawn_server(ws_id, &workspace.path, port).await?;
+            port = self.ensure_server(ws_id, &workspace.path, recorded, port).await?;
         }
 
         let cmux_ws = self
@@ -232,6 +287,8 @@ impl WorkspaceManager {
     /// # Errors
     /// Any failure while draining, killing, or closing panels.
     pub async fn off(&self, ws_id: &str, graceful: bool) -> Result<()> {
+        // I-2: serialize per-workspace so `on`/`off` cannot interleave.
+        let _lifecycle = self.lifecycle_guard(ws_id).await;
         let workspace = {
             let fleet = self.fleet.lock().await;
             fleet.workspace(ws_id).cloned().context("workspace not registered")?
@@ -262,6 +319,9 @@ impl WorkspaceManager {
             let _ = self.cmux.close_workspace(cmux_ws).await;
         }
         self.kill_server(ws_id).await?;
+        // I-6: an adopted server (from a previous daemon) is not a tracked
+        // child — kill it by recorded port so `off` truly frees the port.
+        self.kill_adopted_server(ws_id).await;
         if let Some(port) = port {
             self.allocator.lock().unwrap_or_else(std::sync::PoisonError::into_inner).free(port);
         }
@@ -435,7 +495,20 @@ impl WorkspaceManager {
         command
             .args(["serve", "--port", &port.to_string(), "--hostname", "127.0.0.1"])
             .current_dir(project)
-            .env("OPENCODE_SERVER_PASSWORD", &self.secret);
+            // I-10: never leak the daemon's full environment (GITHUB_TOKEN,
+            // OPENAI_API_KEY, …) to every workspace's agents — a prompt-
+            // injection exfiltration vector. Allowlist only what serve needs.
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("OPENCODE_SERVER_PASSWORD", &self.secret)
+            .env("NO_COLOR", "1");
+        if let Some(sock) = std::env::var_os("CMUX_SOCKET_PATH") {
+            command.env("CMUX_SOCKET_PATH", sock);
+        }
+        if let Some(pw) = std::env::var_os("CMUX_SOCKET_PASSWORD") {
+            command.env("CMUX_SOCKET_PASSWORD", pw);
+        }
         let child = command
             .spawn()
             .with_context(|| format!("spawn {}/serve on port {port}", self.opencode_bin))?;
@@ -471,6 +544,16 @@ impl WorkspaceManager {
     ) -> Result<Vec<Agent>> {
         let mut agents = Vec::new();
         for roster in &config.agent {
+            // I-5: the cmux driver is not implemented (M9); a cmux roster agent
+            // can never receive deliveries. Surface it loudly at bring-up so it
+            // is not a silent forever-retry.
+            if roster.driver == supervisor_core::types::DriverKind::Cmux {
+                tracing::warn!(
+                    ws = ws_id,
+                    agent = %roster.id,
+                    "cmux driver is not implemented (M9); this agent will not receive inbox deliveries"
+                );
+            }
             let existing = {
                 let fleet = self.fleet.lock().await;
                 fleet.agent(ws_id, &roster.id).cloned()
@@ -618,7 +701,10 @@ impl WorkspaceManager {
         }
     }
 
-    /// Kill the workspace's server child (SIGTERM, then SIGKILL after 10s).
+    /// Kill the workspace's server: SIGTERM, then SIGKILL after the grace
+    /// window (review I-6 — the doc claimed SIGTERM-then-SIGKILL but the code
+    /// sent SIGKILL immediately). Adopted servers are not tracked children, so
+    /// callers that need them gone must use `kill_adopted_server`.
     async fn kill_server(&self, ws_id: &str) -> Result<()> {
         let child = {
             let mut children =
@@ -626,8 +712,21 @@ impl WorkspaceManager {
             children.remove(ws_id)
         };
         if let Some(mut server) = child {
-            server.child.start_kill().ok();
-            let _ = tokio::time::timeout(KILL_WAIT, server.child.wait()).await;
+            if let Some(pid) = server.child.id() {
+                // Graceful first: SIGTERM, then SIGKILL after KILL_WAIT.
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status()
+                    .await;
+                let _ = tokio::time::timeout(KILL_WAIT, server.child.wait()).await;
+                if server.child.try_wait().ok().flatten().is_none() {
+                    server.child.start_kill().ok();
+                    let _ = server.child.wait().await;
+                }
+            } else {
+                server.child.start_kill().ok();
+                let _ = tokio::time::timeout(KILL_WAIT, server.child.wait()).await;
+            }
             let mut fleet = self.fleet.lock().await;
             if let Some(ws) = fleet.workspace(ws_id).cloned() {
                 let mut ws = ws;
@@ -637,6 +736,20 @@ impl WorkspaceManager {
             }
         }
         Ok(())
+    }
+
+    /// Kill an adopted server (not a tracked child) via its recorded port,
+    /// so `off` really releases the port (review I-6).
+    async fn kill_adopted_server(&self, ws_id: &str) {
+        let port = {
+            let fleet = self.fleet.lock().await;
+            fleet.workspace(ws_id).and_then(Workspace::recorded_port)
+        };
+        let Some(port) = port else { return };
+        if let Some(pid) = process_pid_on_port(port).await {
+            tracing::info!(ws = ws_id, port, pid, "off: killing adopted server");
+            kill_pid(pid).await;
+        }
     }
 }
 
@@ -676,6 +789,12 @@ pub async fn wait_for_health(client: &OpencodeClient, timeout: Duration) -> Resu
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Bind-probe a port (§4.2, review I-7): succeeds when the port is free; the
+/// listener is dropped immediately so the `serve` child can bind it.
+async fn probe_port(port: u16) -> bool {
+    tokio::net::TcpListener::bind(("127.0.0.1", port)).await.is_ok()
 }
 
 /// The PID of the process listening on `port` (LISTEN state), via `lsof`.

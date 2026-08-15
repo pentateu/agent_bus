@@ -10,7 +10,7 @@ const ROLE_PALETTE = ["dev", "reviewer", "tester", "designer", "memory-keeper"];
 function useGraphNodeStates(graphId: string): Record<string, import("../api/types").NodeState> {
   const { data } = useQuery({
     queryKey: ["graphNodes", graphId],
-    queryFn: () => api.graphNodes(graphId),
+    queryFn: () => api.graphNodes(undefined, graphId),
     refetchInterval: 2000,
   });
   return (data ?? []).reduce<Record<string, import("../api/types").NodeState>>((acc, row) => {

@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS graph (
 );
 
 CREATE TABLE IF NOT EXISTS node_state (
+  workspace_id TEXT NOT NULL,
   graph_id     TEXT NOT NULL REFERENCES graph(id),
   node_id      TEXT NOT NULL,
   state        TEXT NOT NULL DEFAULT 'pending',
@@ -84,7 +85,7 @@ CREATE TABLE IF NOT EXISTS node_state (
   started_at   TEXT,
   finished_at  TEXT,
   error        TEXT,
-  PRIMARY KEY (graph_id, node_id)
+  PRIMARY KEY (workspace_id, graph_id, node_id)
 );
 
 CREATE TABLE IF NOT EXISTS decision (
@@ -274,6 +275,12 @@ impl Store {
         }
         let conn =
             Connection::open(path).with_context(|| format!("opening store {}", path.display()))?;
+        // I-32: the DB mirrors journal contents; 0600 (the file may predate
+        // this fix, so force it every open).
+        if let Ok(metadata) = std::fs::metadata(path) {
+            use std::os::unix::fs::PermissionsExt as _;
+            metadata.permissions().set_mode(0o600);
+        }
         conn.execute_batch(SCHEMA).context("migrating store schema")?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -612,13 +619,14 @@ impl Store {
     pub fn set_node_state(&self, s: &NodeStateRow) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         conn.execute(
-            r"INSERT INTO node_state (graph_id, node_id, state, attempt, started_at, finished_at, error)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-               ON CONFLICT(graph_id, node_id) DO UPDATE SET
+            r"INSERT INTO node_state (workspace_id, graph_id, node_id, state, attempt, started_at, finished_at, error)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+               ON CONFLICT(workspace_id, graph_id, node_id) DO UPDATE SET
                  state = excluded.state, attempt = excluded.attempt,
                  started_at = excluded.started_at, finished_at = excluded.finished_at,
                  error = excluded.error",
             params![
+                s.workspace_id,
                 s.graph_id,
                 s.node_id,
                 s.state.to_db(),
@@ -634,24 +642,29 @@ impl Store {
 
     /// # Errors
     /// Any `SQLite` failure.
-    pub fn list_node_states(&self, graph_id: &str) -> Result<Vec<NodeStateRow>> {
+    pub fn list_node_states(
+        &self,
+        workspace_id: &str,
+        graph_id: &str,
+    ) -> Result<Vec<NodeStateRow>> {
         let conn = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut stmt = conn
             .prepare(
-                "SELECT graph_id, node_id, state, attempt, started_at, finished_at, error
-                 FROM node_state WHERE graph_id = ?1",
+                "SELECT workspace_id, graph_id, node_id, state, attempt, started_at, finished_at, error
+                 FROM node_state WHERE workspace_id = ?1 AND graph_id = ?2",
             )
             .context("prepare list node states")?;
         let rows = stmt
-            .query_map(params![graph_id], |r| {
+            .query_map(params![workspace_id, graph_id], |r| {
                 Ok(NodeStateRow {
-                    graph_id: r.get(0)?,
-                    node_id: r.get(1)?,
-                    state: parse_node_state(&r.get::<_, String>(2)?),
-                    attempt: u32::try_from(r.get::<_, i64>(3)?).unwrap_or(u32::MAX),
-                    started_at: r.get(4)?,
-                    finished_at: r.get(5)?,
-                    error: r.get(6)?,
+                    workspace_id: r.get(0)?,
+                    graph_id: r.get(1)?,
+                    node_id: r.get(2)?,
+                    state: parse_node_state(&r.get::<_, String>(3)?),
+                    attempt: u32::try_from(r.get::<_, i64>(4)?).unwrap_or(u32::MAX),
+                    started_at: r.get(5)?,
+                    finished_at: r.get(6)?,
+                    error: r.get(7)?,
                 })
             })
             .context("query list node states")?;
@@ -1282,6 +1295,7 @@ mod tests {
         s.upsert_graph(&g).unwrap();
         assert_eq!(s.get_graph("feature_lifecycle").unwrap().unwrap().id, "feature_lifecycle");
         let node = NodeStateRow {
+            workspace_id: "iot".to_owned(),
             graph_id: "feature_lifecycle".to_owned(),
             node_id: "dev".to_owned(),
             state: NodeState::Running,
@@ -1291,7 +1305,7 @@ mod tests {
             error: None,
         };
         s.set_node_state(&node).unwrap();
-        let states = s.list_node_states("feature_lifecycle").unwrap();
+        let states = s.list_node_states("iot", "feature_lifecycle").unwrap();
         assert_eq!(states[0].state, NodeState::Running);
         assert_eq!(states[0].attempt, 1);
     }

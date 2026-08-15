@@ -230,6 +230,10 @@ pub struct InboxDeliverEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowTransitionEvent {
+    /// I-1: workspace-scoped node state. `default` keeps pre-I-1 records
+    /// replayable (they map to the empty-workspace key).
+    #[serde(default)]
+    pub workspace_id: String,
     pub graph_id: String,
     pub node_id: String,
     pub state: NodeState,
@@ -242,6 +246,7 @@ pub struct WorkflowTransitionEvent {
 impl From<WorkflowTransitionEvent> for crate::types::NodeStateRow {
     fn from(e: WorkflowTransitionEvent) -> Self {
         Self {
+            workspace_id: e.workspace_id,
             graph_id: e.graph_id,
             node_id: e.node_id,
             state: e.state,
@@ -256,6 +261,7 @@ impl From<WorkflowTransitionEvent> for crate::types::NodeStateRow {
 impl From<crate::types::NodeStateRow> for WorkflowTransitionEvent {
     fn from(r: crate::types::NodeStateRow) -> Self {
         Self {
+            workspace_id: r.workspace_id,
             graph_id: r.graph_id,
             node_id: r.node_id,
             state: r.state,

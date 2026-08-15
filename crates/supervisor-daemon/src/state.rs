@@ -8,6 +8,7 @@
 //! so there is never a second master.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -30,7 +31,7 @@ pub struct FleetState {
     ports: BTreeMap<u16, PortRow>,
     inboxes: BTreeMap<(String, String), VecDeque<InboxEntry>>,
     graphs: BTreeMap<String, Graph>,
-    node_states: BTreeMap<(String, String), NodeStateRow>,
+    node_states: BTreeMap<(String, String, String), NodeStateRow>,
     decisions: Vec<DecisionRecord>,
     rules: BTreeMap<String, StoredRule>,
     proposals: BTreeMap<String, Proposal>,
@@ -70,6 +71,9 @@ impl Fleet {
     pub fn open(state_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("creating state dir {}", state_dir.display()))?;
+        // I-32: the state dir holds tokens, secrets, and journaled inbox
+        // bodies — 0700, not the default 0755.
+        let _ = std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700));
         let journal = Journal::open(&state_dir.join("journal.jsonl"))?;
         let store = Store::open(&state_dir.join("supervisor.db"))?;
         let (records, skipped) = journal.replay_file()?;
@@ -105,6 +109,8 @@ impl Fleet {
         let tmp_path = self.state_dir.join("fleet.json.tmp");
         std::fs::write(&tmp_path, &bytes)
             .with_context(|| format!("writing {}", tmp_path.display()))?;
+        // I-32: fleet.json reflects journal contents (secrets-adjacent); 0600.
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600));
         std::fs::rename(&tmp_path, &final_path)
             .with_context(|| format!("renaming onto {}", final_path.display()))
     }
@@ -218,7 +224,12 @@ impl Fleet {
     pub fn set_node_state(&mut self, row: &NodeStateRow) -> Result<JournalRecord> {
         let record =
             self.journal.append(JournalType::WorkflowTransition, serde_json::to_value(row)?)?;
-        self.state.node_states.insert((row.graph_id.clone(), row.node_id.clone()), row.clone());
+        // I-1: keyed per workspace — two workspaces running the same graph
+        // cannot corrupt each other's rows.
+        self.state.node_states.insert(
+            (row.workspace_id.clone(), row.graph_id.clone(), row.node_id.clone()),
+            row.clone(),
+        );
         self.store.set_node_state(row)?;
         self.store.journal_row(&record)?;
         Ok(record)
@@ -460,14 +471,25 @@ impl Fleet {
     }
 
     #[must_use]
-    pub fn node_state(&self, graph: &str, node: &str) -> Option<&NodeStateRow> {
-        self.state.node_states.get(&(graph.to_owned(), node.to_owned()))
+    pub fn node_state(&self, ws: &str, graph: &str, node: &str) -> Option<&NodeStateRow> {
+        self.state.node_states.get(&(ws.to_owned(), graph.to_owned(), node.to_owned()))
     }
 
-    /// Node-state rows for a graph.
+    /// Node-state rows for a workspace's graph (I-1: workspace-scoped).
     #[must_use = "iterators are lazy; the results are only produced when consumed"]
-    pub fn node_states(&self, graph: &str) -> impl Iterator<Item = &NodeStateRow> {
-        self.state.node_states.iter().filter(move |((g, _), _)| g == graph).map(|(_, row)| row)
+    pub fn node_states(&self, ws: &str, graph: &str) -> impl Iterator<Item = &NodeStateRow> {
+        self.state
+            .node_states
+            .iter()
+            .filter(move |((w, g, _), _)| w == ws && g == graph)
+            .map(|(_, row)| row)
+    }
+
+    /// Node-state rows for a graph across all workspaces (rows carry their
+    /// `workspace_id`; used by the unfiltered API view).
+    #[must_use = "iterators are lazy; the results are only produced when consumed"]
+    pub fn node_states_all(&self, graph: &str) -> impl Iterator<Item = &NodeStateRow> {
+        self.state.node_states.iter().filter(move |((_, g, _), _)| g == graph).map(|(_, row)| row)
     }
 
     #[must_use]
@@ -549,7 +571,10 @@ impl FleetState {
                 // the presence of a `graph_id` field.
                 if let Some(event) = record.as_workflow_transition() {
                     let row: NodeStateRow = event.into();
-                    self.node_states.insert((row.graph_id.clone(), row.node_id.clone()), row);
+                    self.node_states.insert(
+                        (row.workspace_id.clone(), row.graph_id.clone(), row.node_id.clone()),
+                        row,
+                    );
                 } else if let Ok(graph) = serde_json::from_value::<Graph>(record.data.clone()) {
                     self.graphs.insert(graph.id.clone(), graph);
                 }
@@ -614,6 +639,72 @@ impl FleetState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_state_is_isolated_per_workspace() {
+        // I-1: two workspaces running the same graph must not corrupt each
+        // other's node-state rows (previously keyed (graph, node) only — a
+        // restart after ws-A completed would silently complete ws-B's node).
+        let dir = tempfile::tempdir().unwrap();
+        let mut fleet = Fleet::open(dir.path()).unwrap();
+        fleet
+            .upsert_graph(&supervisor_core::types::Graph {
+                id: "feature_lifecycle".to_owned(),
+                name: "feature_lifecycle".to_owned(),
+                data: r#"{"id":"feature_lifecycle","name":"g","nodes":[]}"#.to_owned(),
+                version: 1,
+                active: true,
+                updated_at: "t".to_owned(),
+            })
+            .unwrap();
+        let row_a = NodeStateRow {
+            workspace_id: "ws_a".to_owned(),
+            graph_id: "feature_lifecycle".to_owned(),
+            node_id: "dev".to_owned(),
+            state: supervisor_core::types::NodeState::Done,
+            attempt: 1,
+            started_at: Some("t".to_owned()),
+            finished_at: None,
+            error: None,
+        };
+        let row_b = NodeStateRow {
+            workspace_id: "ws_b".to_owned(),
+            graph_id: "feature_lifecycle".to_owned(),
+            node_id: "dev".to_owned(),
+            state: supervisor_core::types::NodeState::Running,
+            attempt: 0,
+            started_at: Some("t".to_owned()),
+            finished_at: None,
+            error: None,
+        };
+        fleet.set_node_state(&row_a).unwrap();
+        fleet.set_node_state(&row_b).unwrap();
+        drop(fleet);
+
+        let reopened = Fleet::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.node_state("ws_a", "feature_lifecycle", "dev").unwrap().state,
+            supervisor_core::types::NodeState::Done
+        );
+        assert_eq!(
+            reopened.node_state("ws_b", "feature_lifecycle", "dev").unwrap().state,
+            supervisor_core::types::NodeState::Running,
+            "ws-B's in-flight node must survive a restart untouched"
+        );
+    }
+
+    #[test]
+    fn state_dir_is_0700_and_projection_is_0600() {
+        // I-32.
+        let dir = tempfile::tempdir().unwrap();
+        let fleet = Fleet::open(dir.path()).unwrap();
+        fleet.write_projection().unwrap();
+        let dir_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        let file_mode =
+            std::fs::metadata(dir.path().join("fleet.json")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "state dir must be 0700");
+        assert_eq!(file_mode, 0o600, "fleet.json must be 0600");
+    }
     use supervisor_core::types::{AgentState, Priority};
 
     fn fleet() -> (Fleet, tempfile::TempDir) {
@@ -705,6 +796,7 @@ mod tests {
         };
         fleet.upsert_graph(&graph).unwrap();
         let row = NodeStateRow {
+            workspace_id: "iot".to_owned(),
             graph_id: "bug_flow".to_owned(),
             node_id: "fix".to_owned(),
             state: supervisor_core::types::NodeState::Running,
@@ -719,7 +811,7 @@ mod tests {
         let reopened = Fleet::open(dir.path()).unwrap();
         assert!(reopened.graph("bug_flow").is_some());
         assert_eq!(
-            reopened.node_state("bug_flow", "fix").unwrap().state,
+            reopened.node_state("iot", "bug_flow", "fix").unwrap().state,
             supervisor_core::types::NodeState::Running
         );
     }

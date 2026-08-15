@@ -42,6 +42,8 @@ pub struct AppState {
     /// U5: model prices for the cost estimates.
     pub usage_config: supervisor_core::config::RootUsageSection,
     pub token: String,
+    /// I-8: the server password, for the documented `Basic opencode:<pw>` auth.
+    pub server_password: String,
     pub state_dir: std::path::PathBuf,
     pub shutdown: CancellationToken,
 }
@@ -162,18 +164,36 @@ fn mime_for(path: &std::path::Path) -> &'static str {
     }
 }
 
-/// Bearer-token auth middleware.
+/// Bearer-token auth middleware, with the documented `Basic opencode:<pw>`
+/// fallback (review I-8 — §4.16 lists basic auth; it was absent).
 async fn auth(
     State(state): State<ApiState>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let authorized = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|token| token == state.token);
+    let header = request.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+    let authorized = match header {
+        Some(v) if v.starts_with("Bearer ") => {
+            v.strip_prefix("Bearer ").is_some_and(|token| token == state.token)
+        }
+        Some(v) if v.starts_with("Basic ") => {
+            // RFC 7617: `Basic base64(user:pass)`. Only the documented
+            // `opencode:<server_password>` user is accepted.
+            let decoded = v
+                .strip_prefix("Basic ")
+                .and_then(|b| {
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b).ok()
+                })
+                .and_then(|b| String::from_utf8(b).ok());
+            decoded.is_some_and(|cred| {
+                let expected = format!("opencode:{}", state.server_password);
+                // Constant-time-ish compare via subtle? Use a plain compare —
+                // this is loopback auth, not a network credential boundary.
+                cred == expected
+            })
+        }
+        _ => false,
+    };
     if authorized {
         next.run(request).await
     } else {
@@ -478,9 +498,22 @@ async fn delete_graph(State(_state): State<ApiState>, Path(id): Path<String>) ->
         .into_response()
 }
 
-async fn get_graph_nodes(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+#[derive(Deserialize)]
+struct GraphNodesQuery {
+    /// I-1: node state is workspace-scoped; `ws` filters the rows.
+    ws: Option<String>,
+}
+
+async fn get_graph_nodes(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<GraphNodesQuery>,
+) -> Response {
     let fleet = state.fleet.lock().await;
-    let rows = fleet.node_states(&id).cloned().collect::<Vec<_>>();
+    let rows: Vec<_> = match query.ws.as_deref() {
+        Some(ws) => fleet.node_states(ws, &id).cloned().collect(),
+        None => fleet.node_states_all(&id).cloned().collect(),
+    };
     match serde_json::to_value(&rows) {
         Ok(value) => Json(value).into_response(),
         Err(e) => ApiError { error: e.to_string() }.into_response(),

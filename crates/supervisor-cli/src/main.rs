@@ -394,7 +394,7 @@ fn smoke(cli: &Cli, ws: &str, graph: &str, timeout: u64) -> Result<()> {
     let mut saw_running = false;
     let mut saw_done = false;
     loop {
-        for node in client.graph_nodes(graph)? {
+        for node in client.graph_nodes(Some(ws), graph)? {
             let id = node["node_id"].as_str().unwrap_or_default().to_owned();
             let state = node["state"].as_str().unwrap_or_default().to_owned();
             if seen.get(&id) != Some(&state) {
@@ -552,10 +552,12 @@ fn dag(cli: &Cli, action: &DagAction) -> Result<()> {
                 }
                 found = true;
                 println!("graph {gid}");
-                if let Ok(nodes) = client.graph_nodes(gid) {
+                if let Ok(nodes) = client.graph_nodes(None, gid) {
                     for node in &nodes {
+                        // I-1: rows are workspace-scoped; surface the ws.
                         println!(
-                            "  {:24} state={:16} attempt={}",
+                            "  {:16} {:24} state={:16} attempt={}",
+                            node["workspace_id"].as_str().unwrap_or_default(),
                             node["node_id"].as_str().unwrap_or_default(),
                             node["state"].as_str().unwrap_or_default(),
                             node["attempt"].as_u64().unwrap_or(0),

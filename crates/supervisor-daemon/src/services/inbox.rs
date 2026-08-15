@@ -77,7 +77,9 @@ impl InboxService {
         };
         for (ws, agent) in targets {
             if let Err(e) = self.deliver_next(&ws, &agent).await {
-                tracing::debug!(ws = %ws, agent = %agent, error = %e, "pending delivery failed");
+                // I-5: a permanently-failing delivery (e.g. an unimplemented
+                // cmux driver) must be loud, not a silent 2s retry.
+                tracing::warn!(ws = %ws, agent = %agent, error = %e, "pending delivery failed");
             }
         }
     }

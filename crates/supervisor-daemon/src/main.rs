@@ -253,6 +253,7 @@ async fn run() -> Result<()> {
         bakeback: Arc::clone(&bakeback),
         usage_config: config.usage.clone(),
         token,
+        server_password: secret.clone(),
         state_dir: state_dir.clone(),
         shutdown: shutdown.clone(),
     });
@@ -382,7 +383,12 @@ async fn ensure_supervisor_workspace(
     command
         .args(["serve", "--port", &port.to_string(), "--hostname", "127.0.0.1"])
         .current_dir(&cwd)
-        .env("OPENCODE_SERVER_PASSWORD", secret);
+        // I-10: never leak the daemon's environment to the supervisor server.
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", std::env::var("HOME").unwrap_or_default())
+        .env("OPENCODE_SERVER_PASSWORD", secret)
+        .env("NO_COLOR", "1");
     let child = command.spawn().with_context(|| format!("spawn supervisor serve on {port}"))?;
     if let Some(pid) = child.id() {
         std::fs::write(&pid_file, pid.to_string())

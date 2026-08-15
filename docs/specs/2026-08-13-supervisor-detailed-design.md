@@ -1206,6 +1206,13 @@ This makes the "bridge" concrete: it is a pair of adapter tasks (send-side
 `post`, receive-side `wait`) per partition, fronting the internal event bus —
 no new transport, no agent-bus changes.
 
+> **Deferral recorded (review I-34, 2026-08-15):** the bridge worker pair is
+> NOT yet implemented in `supervisor-daemon` (no outbound `post` / inbound
+> `wait` relay per partition exists). It is the mechanism that closes the loop
+> for non-opencode harnesses; it is deferred until after the Graph Engine v2
+> (P1–P7) cycle. The opencode driver covers the current fleet; a
+> non-opencode harness should not be added to a roster until the bridge lands.
+
 ---
 
 ## 8. State machine (agent)

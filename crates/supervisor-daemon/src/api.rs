@@ -85,9 +85,11 @@ pub fn router(state: &ApiState) -> Router {
         .route("/api/v1/graphs/{id}", get(get_graph).put(put_graph).delete(delete_graph))
         .route("/api/v1/graphs/{id}/nodes", get(get_graph_nodes))
         .route("/api/v1/workspaces/{ws}/graphs/{graph}/start", post(start_workflow))
+        .route("/api/v1/workspaces/{ws}/graphs/{graph}/nodes/{node}/decide", post(decide_node))
         .route("/api/v1/rules", get(list_rules).post(add_rule))
         .route("/api/v1/rules/reload", post(reload_rules))
         .route("/api/v1/decision-log", get(decision_log))
+        .route("/api/v1/triage", get(triage))
         .route("/api/v1/decision-log/{id}/outcome", post(decision_outcome))
         .route("/api/v1/bakeback/proposals", get(list_proposals))
         .route("/api/v1/bakeback/preview", post(preview_bakeback))
@@ -234,7 +236,17 @@ async fn register_workspace(
     let existing = fleet.workspace(&body.id).cloned();
     let workspace = supervisor_core::types::Workspace {
         id: body.id.clone(),
-        path: body.path,
+        // Defensive: expand a literal `~` in a hand-provided path (the
+        // discovery path does the same; a raw tilde breaks spawn/current_dir).
+        path: {
+            let raw = std::path::Path::new(&body.path).to_path_buf();
+            let raw = raw.to_string_lossy();
+            if let Some(rest) = raw.strip_prefix("~/") {
+                std::env::var("HOME").unwrap_or_default() + "/" + rest
+            } else {
+                body.path.clone()
+            }
+        },
         port: existing.as_ref().and_then(|w| w.port),
         server_pid: existing.as_ref().and_then(|w| w.server_pid),
         state: supervisor_core::types::WorkspaceState::Off,
@@ -591,6 +603,92 @@ async fn start_workflow(
         }
         Err(e) => ApiError { error: e.to_string() }.into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct DecideBody {
+    /// `done` | `rerun` | `skip`.
+    action: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// A4: `POST /api/v1/workspaces/{ws}/graphs/{graph}/nodes/{node}/decide` —
+/// a human ruling on a `NeedsDecision` node. Journaled as a decision record
+/// before the engine transition (C-2).
+async fn decide_node(
+    State(state): State<ApiState>,
+    Path((ws, graph, node)): Path<(String, String, String)>,
+    Json(body): Json<DecideBody>,
+) -> Response {
+    match state.workflows.decide(&ws, &graph, &node, &body.action, body.reason.as_deref()).await {
+        Ok(new_state) => Json(serde_json::json!({
+            "node": node,
+            "state": new_state,
+            "action": body.action,
+            "workspace": ws,
+            "graph": graph,
+        }))
+        .into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.contains("not needs_decision") {
+                StatusCode::CONFLICT
+            } else if msg.contains("unknown") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(ApiError { error: msg })).into_response()
+        }
+    }
+}
+
+/// A5: `GET /api/v1/triage` — the read-only attention aggregate: agents in
+/// `waiting_input` / `blocked_permission` / `error`, and nodes in
+/// `needs_decision` / `failed` / `blocked` / `missing_role`. Dumb on purpose:
+/// sorting and filtering are client-side.
+async fn triage(State(state): State<ApiState>) -> Response {
+    let fleet = state.fleet.lock().await;
+    let mut agents = Vec::new();
+    let mut nodes = Vec::new();
+    for ws in fleet.workspaces() {
+        for a in fleet.agents(&ws.id) {
+            if matches!(
+                a.state,
+                supervisor_core::types::AgentState::WaitingInput
+                    | supervisor_core::types::AgentState::BlockedPermission
+                    | supervisor_core::types::AgentState::Error
+            ) {
+                agents.push(serde_json::json!({
+                    "ws": ws.id,
+                    "agent_id": a.agent_id,
+                    "state": a.state,
+                    "permission_id": null,
+                }));
+            }
+        }
+        for g in fleet.graphs() {
+            for row in fleet.node_states(&ws.id, &g.id) {
+                if matches!(
+                    row.state,
+                    supervisor_core::types::NodeState::NeedsDecision
+                        | supervisor_core::types::NodeState::Failed
+                        | supervisor_core::types::NodeState::Blocked
+                        | supervisor_core::types::NodeState::MissingRole
+                ) {
+                    nodes.push(serde_json::json!({
+                        "ws": ws.id,
+                        "graph_id": g.id,
+                        "node_id": row.node_id,
+                        "state": row.state,
+                        "error": row.error,
+                    }));
+                }
+            }
+        }
+    }
+    Json(serde_json::json!({ "agents": agents, "nodes": nodes })).into_response()
 }
 
 /// Ensure a workspace is `on` and start the graph for an intake item, linking

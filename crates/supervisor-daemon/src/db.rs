@@ -1144,6 +1144,7 @@ impl DbCodec for NodeState {
             Self::Done => "done",
             Self::Failed => "failed",
             Self::NeedsDecision => "needs_decision",
+            Self::MissingRole => "missing_role",
         }
     }
 
@@ -1155,6 +1156,7 @@ impl DbCodec for NodeState {
             "done" => Self::Done,
             "failed" => Self::Failed,
             "needs_decision" => Self::NeedsDecision,
+            "missing_role" => Self::MissingRole,
             _ => Self::Pending,
         }
     }
@@ -1406,5 +1408,40 @@ mod tests {
         assert!(s.list_workspaces().unwrap().is_empty());
         s.upsert_workspace(&ws("iot")).unwrap();
         assert_eq!(s.list_workspaces().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod node_state_codec_tests {
+    use super::*;
+
+    #[test]
+    fn missing_role_roundtrips_both_directions() {
+        // A2: the surface marker persists and restores.
+        let s = NodeState::MissingRole;
+        assert_eq!(s.to_db(), "missing_role");
+        assert_eq!(NodeState::from_db("missing_role"), NodeState::MissingRole);
+    }
+
+    #[test]
+    fn unknown_string_falls_back_to_pending() {
+        // Replay-safe: an unknown future string must not crash restore.
+        assert_eq!(NodeState::from_db("fancy_future_state"), NodeState::Pending);
+    }
+
+    #[test]
+    fn every_state_roundtrips() {
+        for state in [
+            NodeState::Pending,
+            NodeState::Ready,
+            NodeState::Running,
+            NodeState::Blocked,
+            NodeState::Done,
+            NodeState::Failed,
+            NodeState::NeedsDecision,
+            NodeState::MissingRole,
+        ] {
+            assert_eq!(NodeState::from_db(state.to_db()), state);
+        }
     }
 }

@@ -485,7 +485,13 @@ async fn discover_projects(
         }
         let workspace = Workspace {
             id: project.project.name.clone(),
-            path: project.project.path.clone(),
+            // The config format (§6.1) allows `path = "~/development/..."`;
+            // expand the literal tilde so spawn/cmux/current_dir work
+            // (caught live: a hand-written supervisor.toml with `~` failed
+            // every `supervisor on` with a spawn ENOENT).
+            path: expand_home(std::path::Path::new(&project.project.path))
+                .to_string_lossy()
+                .into_owned(),
             port: None,
             server_pid: None,
             state: WorkspaceState::Off,

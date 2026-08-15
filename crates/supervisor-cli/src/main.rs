@@ -133,6 +133,15 @@ pub enum DagAction {
     Status {
         id: Option<String>,
     },
+    /// A4: rule on a `NeedsDecision` node (`done` | `rerun` | `skip`).
+    Decide {
+        graph: String,
+        node: String,
+        #[arg(long)]
+        action: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 impl Cli {
@@ -259,6 +268,37 @@ fn status(cli: &Cli) -> Result<()> {
                     agent["session_id"].as_str().unwrap_or("none"),
                 );
             }
+        }
+    }
+    // A5: the triage section — one line per attention-state node/agent.
+    match client.triage() {
+        Ok(triage) => {
+            let agents = triage["agents"].as_array().cloned().unwrap_or_default();
+            let nodes = triage["nodes"].as_array().cloned().unwrap_or_default();
+            if agents.is_empty() && nodes.is_empty() {
+                println!("triage: nothing needs attention");
+            } else {
+                for a in &agents {
+                    println!(
+                        "triage: agent {}/{} ({})",
+                        a["ws"].as_str().unwrap_or_default(),
+                        a["agent_id"].as_str().unwrap_or_default(),
+                        a["state"].as_str().unwrap_or_default(),
+                    );
+                }
+                for n in &nodes {
+                    println!(
+                        "triage: node {}/{} ({}) in {}",
+                        n["graph_id"].as_str().unwrap_or_default(),
+                        n["node_id"].as_str().unwrap_or_default(),
+                        n["state"].as_str().unwrap_or_default(),
+                        n["ws"].as_str().unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("triage unavailable: {e}");
         }
     }
     Ok(())
@@ -596,6 +636,22 @@ fn dag(cli: &Cli, action: &DagAction) -> Result<()> {
             if !found && let Some(want) = id {
                 anyhow::bail!(crate::client::TargetNotFound(format!("unknown graph {want}")));
             }
+        }
+        DagAction::Decide { graph, node, action, reason } => {
+            // A4: resolve the workspace from the (workspace-scoped) node-state
+            // rows — a graph runs in at most one workspace. Unknown
+            // graph/node → exit 2; not needs-decision → exit 1.
+            let ws = {
+                let rows = client.graph_nodes(None, graph)?;
+                rows.iter()
+                    .find(|r| r["node_id"].as_str() == Some(node.as_str()))
+                    .and_then(|r| r["workspace_id"].as_str().map(str::to_owned))
+                    .ok_or_else(|| {
+                        crate::client::TargetNotFound(format!("unknown node {node:?} in {graph:?}"))
+                    })?
+            };
+            let result = client.decide_node(&ws, graph, node, action, reason.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
     }
     Ok(())

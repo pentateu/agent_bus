@@ -107,7 +107,12 @@ impl CmuxClient for ProcessCmux {
         if out.is_empty() {
             return Ok(Vec::new());
         }
-        serde_json::from_str(&out).context("decode cmux list-workspaces")
+        // A3 (caught live): `cmux list-workspaces --json` returns an object
+        // `{ "workspaces": [ {id, custom_title, …} ] }`, not a bare array,
+        // and the supervisor-created name lives in `custom_title`. The old
+        // code decoded a bare array — it always failed, so adoption fell back
+        // to creating a duplicate workspace on every `on()`.
+        Ok(parse_list_workspaces(&out)?)
     }
 
     async fn new_workspace(&self, name: &str, cwd: &Path) -> Result<CmuxHandle> {
@@ -187,6 +192,33 @@ impl CmuxClient for ProcessCmux {
 ///
 /// cmux returns `{"surface_ref": "surface:45", "pane_ref": "pane:16", ...}`
 /// (or plain text `OK surface:46 pane:16 workspace:7`), so both the `*_ref`
+/// Parse the real `cmux list-workspaces --json` output (A3): an object with
+/// a `workspaces` array whose entries carry `id` + `custom_title` (the name
+/// `new_workspace --name X` sets). A bare-array input is also tolerated.
+fn parse_list_workspaces(out: &str) -> Result<Vec<CmuxWorkspace>> {
+    let value: serde_json::Value =
+        serde_json::from_str(out).context("decode cmux list-workspaces")?;
+    let arr = value
+        .get("workspaces")
+        .or_else(|| value.get("windows"))
+        .or_else(|| value.as_array().map(|_| &value))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(arr
+        .into_iter()
+        .filter_map(|w| {
+            let id = w.get("id")?.as_str()?.to_owned();
+            let name = w
+                .get("custom_title")
+                .or_else(|| w.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            Some(CmuxWorkspace { id, name })
+        })
+        .collect())
+}
+
 /// Extract a handle from cmux output: prefer JSON `*_ref`/`id` fields, then
 /// the first whitespace-separated token of the requested kind (e.g.
 /// `surface:46`). Returns `None` when no handle is present — callers must
@@ -239,5 +271,36 @@ mod tests {
     #[test]
     fn handle_extraction_defaults() {
         assert_eq!(extract_handle("(no output)", "workspace"), None, "no bogus surface:0 fallback");
+    }
+}
+
+#[cfg(test)]
+mod list_workspaces_tests {
+    use super::*;
+
+    #[test]
+    fn parses_the_real_cmux_object_shape() {
+        // A3: the actual `list-workspaces --json` shape — object with a
+        // `workspaces` array, name in `custom_title`. The old decoder
+        // expected a bare array and always failed, so adoption never ran.
+        let out = r#"{
+          "window_ref": "window:1",
+          "workspaces": [
+            { "id": "UUID-1", "custom_title": "smoke-i31", "current_directory": "/x" },
+            { "id": "UUID-2", "custom_title": "AI_Tutor", "current_directory": "/y" }
+          ]
+        }"#;
+        let ws = parse_list_workspaces(out).unwrap();
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws[0].id, "UUID-1");
+        assert_eq!(ws[0].name.as_deref(), Some("smoke-i31"));
+        assert_eq!(ws[1].name.as_deref(), Some("AI_Tutor"));
+    }
+
+    #[test]
+    fn tolerates_a_bare_array() {
+        let ws = parse_list_workspaces(r#"[{"id":"a","name":"x"}]"#).unwrap();
+        assert_eq!(ws[0].id, "a");
+        assert_eq!(ws[0].name.as_deref(), Some("x"));
     }
 }

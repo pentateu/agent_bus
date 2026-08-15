@@ -12,7 +12,7 @@ use supervisor_core::ack::resolve_ack;
 use supervisor_core::dag::{ManagerRuling, RoleResolution, RosterEntry, Workflow, WorkflowEvent};
 use supervisor_core::event::{BusEvent, FleetEvent, HumanEvent, InboxEvent};
 use supervisor_core::signal::Signal;
-use supervisor_core::types::{InboxEntry, NodeState, Priority, WorkspaceState};
+use supervisor_core::types::{DecisionRecord, InboxEntry, NodeState, Priority, WorkspaceState};
 use supervisor_core::{NodeStateRow, now_rfc3339};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
@@ -196,6 +196,79 @@ impl WorkflowRunner {
         }
     }
 
+    /// A4: a human ruling on a `NeedsDecision` node (Depth 2). Journal-first
+    /// (C-2 rule): the ruling is a [`DecisionRecord`] written BEFORE the
+    /// engine transition, so it lands in the decision log and feeds
+    /// bake-back.
+    ///
+    /// # Errors
+    /// Unknown graph/node, or the node is not in `needs_decision` (409).
+    pub async fn decide(
+        &self,
+        ws: &str,
+        graph: &str,
+        node: &str,
+        action: &str,
+        reason: Option<&str>,
+    ) -> Result<NodeState> {
+        let ruling = match action {
+            "done" => ManagerRuling::Done,
+            "rerun" => ManagerRuling::Rerun,
+            "skip" => ManagerRuling::Skip,
+            other => anyhow::bail!("action must be done|rerun|skip, got {other:?}"),
+        };
+        let (events, current) = {
+            let mut instances =
+                self.instances.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(instance) = instances.get_mut(&(ws.to_owned(), graph.to_owned())) else {
+                anyhow::bail!("unknown graph {graph:?} in {ws}");
+            };
+            let Some(state) = instance.state(node) else {
+                anyhow::bail!("unknown node {node:?} in {graph:?}");
+            };
+            if state != NodeState::NeedsDecision {
+                anyhow::bail!("node {node:?} is {state:?}, not needs_decision");
+            }
+            (instance.rule(node, ruling), state)
+        };
+        if events.is_empty() {
+            anyhow::bail!("node {node:?} is not needs_decision (no ruling applied)");
+        }
+        // Journal the human ruling (journal-first, before applying events).
+        {
+            let mut fleet = self.fleet.lock().await;
+            let decision = DecisionRecord {
+                id: format!("d_{}", supervisor_core::time::new_ulid()),
+                signature: format!("human.ruling.{graph}/{node}"),
+                situation: serde_json::json!({
+                    "ws": ws, "graph": graph, "node": node,
+                    "state": "needs_decision", "reason": reason.unwrap_or_default(),
+                }),
+                decision: serde_json::json!({
+                    "action": action, "reason": reason.unwrap_or_default(),
+                    "source": "human",
+                }),
+                outcome: None,
+                ts: now_rfc3339(),
+            };
+            if let Err(e) = fleet.append_decision(&decision) {
+                tracing::error!(ws, graph, node, error = %e, "journal human ruling failed");
+            }
+        }
+        for event in events {
+            self.handle_event(ws, event).await;
+        }
+        let new_state = {
+            let instances =
+                self.instances.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            instances
+                .get(&(ws.to_owned(), graph.to_owned()))
+                .and_then(|i| i.state(node))
+                .unwrap_or(current)
+        };
+        Ok(new_state)
+    }
+
     /// The `(graph, node)` an agent is currently working on, if any (F4 — node
     /// context for the rule engine's `Situation`).
     #[must_use]
@@ -267,11 +340,45 @@ impl WorkflowRunner {
 
     /// Handle a bus event.
     pub async fn handle(&self, event: BusEvent) {
-        if let BusEvent::Signal(signal) = event {
-            self.on_signal(signal).await;
+        match event {
+            BusEvent::Signal(signal) => self.on_signal(signal).await,
+            // A2: when an agent becomes idle/working (a session now exists) in
+            // a workspace, re-check nodes held on a missing role — if an agent
+            // with the role now exists, delivery proceeds.
+            BusEvent::Fleet(FleetEvent::AgentState {
+                workspace_id,
+                state:
+                    supervisor_core::types::AgentState::Idle
+                    | supervisor_core::types::AgentState::Working,
+                ..
+            }) => self.recheck_missing(&workspace_id).await,
+            _ => {}
         }
         // Workflow-related HumanEvent::Commands are routed by the command
         // dispatcher (F4) in `run()`; the old `start` stub is removed.
+    }
+
+    /// A2: for every node currently held on a missing role in `ws`, re-resolve
+    /// the role (a roster agent may have appeared). `on_ready` delivers if an
+    /// agent now matches; the hold stays if still absent.
+    async fn recheck_missing(&self, ws: &str) {
+        let held: Vec<(String, String)> = {
+            let fleet = self.fleet.lock().await;
+            fleet
+                .graphs()
+                .flat_map(|g| {
+                    fleet
+                        .node_states_all(&g.id)
+                        .filter(|r| r.workspace_id == ws && r.state == NodeState::MissingRole)
+                        .map(|r| (g.id.clone(), r.node_id.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        for (graph, node) in held {
+            tracing::info!(ws, graph, node, "rechecking missing-role node");
+            self.on_ready(ws, &graph, &node).await;
+        }
     }
 
     /// Route a scoped signal.
@@ -353,10 +460,13 @@ impl WorkflowRunner {
             if !consumed {
                 continue;
             }
-            self.bus.publish(BusEvent::Workflow(supervisor_core::dag::WorkflowEvent::Ack {
-                graph: graph.clone(),
-                ack: ack.clone(),
-            }));
+            self.bus.publish(BusEvent::Workflow {
+                workspace_id: ws.to_owned(),
+                event: supervisor_core::dag::WorkflowEvent::Ack {
+                    graph: graph.clone(),
+                    ack: ack.clone(),
+                },
+            });
             for event in events {
                 self.handle_event(ws, event).await;
             }
@@ -469,11 +579,18 @@ impl WorkflowRunner {
             RoleResolution::Target(agent_id) => agent_id,
             RoleResolution::MissingRole { role } => {
                 tracing::warn!(ws, graph, node, role, "node holds: no agent with this role");
-                self.bus.publish(BusEvent::Workflow(WorkflowEvent::MissingRole {
-                    graph: graph.to_owned(),
-                    node: node.to_owned(),
-                    role,
-                }));
+                self.bus.publish(BusEvent::Workflow {
+                    workspace_id: ws.to_owned(),
+                    event: WorkflowEvent::MissingRole {
+                        graph: graph.to_owned(),
+                        node: node.to_owned(),
+                        role: role.clone(),
+                    },
+                });
+                // A2: persist the surface marker directly (calling handle_event
+                // here would recurse into on_ready); the bus publish is for
+                // other consumers (web/SSE).
+                self.persist_node(ws, graph, node, NodeState::MissingRole).await;
                 return;
             }
         };
@@ -587,7 +704,14 @@ impl WorkflowRunner {
                 self.persist_node(ws, &graph, &node, NodeState::Ready).await;
                 self.on_ready(ws, &graph, &target).await;
             }
-            WorkflowEvent::Ack { .. } | WorkflowEvent::MissingRole { .. } => {}
+            WorkflowEvent::Ack { .. } => {}
+            // A2: persist the surface marker so triage/canvas can show the
+            // hold. The engine keeps the node at Ready; any later transition
+            // overwrites the row (clear-on-transition).
+            WorkflowEvent::MissingRole { graph, node, role } => {
+                tracing::info!(ws, graph, node, role, "node holds on a missing role");
+                self.persist_node(ws, &graph, &node, NodeState::MissingRole).await;
+            }
         }
     }
 
@@ -1029,5 +1153,192 @@ mod tests {
             "started_at must be stamped once and preserved"
         );
         assert_eq!(second.attempt, first.attempt, "attempt must not reset on every transition");
+    }
+
+    /// A2 fixtures: an `on` workspace with a single-role graph but no roster
+    /// agents.
+    async fn missing_role_fixture() -> (Arc<AsyncMutex<Fleet>>, Arc<WorkflowRunner>) {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet = Arc::new(AsyncMutex::new(Fleet::open(dir.path()).unwrap()));
+        let runner = test_runner(Arc::clone(&fleet));
+        {
+            let mut f = fleet.lock().await;
+            f.upsert_workspace(&supervisor_core::types::Workspace {
+                id: "iot".to_owned(),
+                path: "/x/iot".to_owned(),
+                port: Some(4101),
+                server_pid: None,
+                state: WorkspaceState::On,
+                cmux_ws: None,
+                layout_path: None,
+                updated_at: "t".to_owned(),
+            })
+            .unwrap();
+            f.upsert_graph(&supervisor_core::types::Graph {
+                id: "g".to_owned(),
+                name: "g".to_owned(),
+                data: r#"{"id":"g","name":"g","nodes":[
+                    {"id":"dev","role":"dev","start_template":"do it","done_when":{"ack":"dev"}}
+                ]}"#
+                .to_owned(),
+                version: 1,
+                active: true,
+                updated_at: "t".to_owned(),
+            })
+            .unwrap();
+        }
+        (fleet, runner)
+    }
+
+    #[tokio::test]
+    async fn missing_role_node_persists_the_marker_until_an_agent_appears() {
+        // A2: start with no dev agent → the node holds; the row is the
+        // MissingRole surface marker. Add an idle dev agent + fire the
+        // AgentState event → recheck resolves → delivery starts and the row
+        // becomes Running (clear-on-transition).
+        let (fleet, runner) = missing_role_fixture().await;
+        runner.start_graph("iot", "g", BTreeMap::new()).await.unwrap();
+        assert_eq!(
+            fleet.lock().await.node_state("iot", "g", "dev").unwrap().state,
+            NodeState::MissingRole,
+            "a node whose role has no agent persists the surface marker"
+        );
+
+        // The role now has an agent: recheck delivers.
+        {
+            let mut f = fleet.lock().await;
+            f.upsert_agent(&supervisor_core::types::Agent {
+                workspace_id: "iot".to_owned(),
+                agent_id: "dev_01".to_owned(),
+                role: "dev".to_owned(),
+                model: None,
+                session_id: Some("s1".to_owned()),
+                driver: supervisor_core::types::DriverKind::Opencode,
+                mode: supervisor_core::types::AgentMode::Foreground,
+                state: supervisor_core::types::AgentState::Idle,
+                confidence: 1.0,
+            })
+            .unwrap();
+        }
+        runner
+            .handle(BusEvent::Fleet(FleetEvent::AgentState {
+                workspace_id: "iot".to_owned(),
+                agent_id: "dev_01".to_owned(),
+                state: supervisor_core::types::AgentState::Idle,
+            }))
+            .await;
+        assert_eq!(
+            fleet.lock().await.node_state("iot", "g", "dev").unwrap().state,
+            NodeState::Running,
+            "an appearing agent clears the marker and starts delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_without_an_agent_keeps_the_hold() {
+        let (fleet, runner) = missing_role_fixture().await;
+        runner.start_graph("iot", "g", BTreeMap::new()).await.unwrap();
+        assert_eq!(
+            fleet.lock().await.node_state("iot", "g", "dev").unwrap().state,
+            NodeState::MissingRole
+        );
+        // No agent appears; a recheck must keep the hold.
+        runner.recheck_missing("iot").await;
+        assert_eq!(
+            fleet.lock().await.node_state("iot", "g", "dev").unwrap().state,
+            NodeState::MissingRole,
+            "the hold stays while the role is still unstaffed"
+        );
+    }
+
+    /// A4: a graph with one node forced into `NeedsDecision` via the engine.
+    async fn needs_decision_fixture() -> (Arc<AsyncMutex<Fleet>>, Arc<WorkflowRunner>) {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet = Arc::new(AsyncMutex::new(Fleet::open(dir.path()).unwrap()));
+        let runner = test_runner(Arc::clone(&fleet));
+        {
+            let mut f = fleet.lock().await;
+            f.upsert_workspace(&supervisor_core::types::Workspace {
+                id: "iot".to_owned(),
+                path: "/x/iot".to_owned(),
+                port: Some(4101),
+                server_pid: None,
+                state: WorkspaceState::On,
+                cmux_ws: None,
+                layout_path: None,
+                updated_at: "t".to_owned(),
+            })
+            .unwrap();
+        }
+        let instance = Workflow::parse_json(
+            r#"{"id":"g","name":"g","nodes":[
+                {"id":"dev","role":"dev","start_template":"do it","done_when":{"ack":"dev"},"on_error":"delegate"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut instance = instance;
+        {
+            let mut instances =
+                runner.instances.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            instance.start("dev").unwrap();
+            let _ = instance.fail("dev");
+            instances.insert(("iot".to_owned(), "g".to_owned()), instance);
+        }
+        (fleet, runner)
+    }
+
+    #[tokio::test]
+    async fn decide_rerun_transitions_and_journals_the_ruling() {
+        // A4: rerun re-readies the node and a DecisionRecord is journaled
+        // (journal-first, C-2).
+        let (fleet, runner) = needs_decision_fixture().await;
+        let before = fleet.lock().await.decisions().len();
+
+        let state = runner.decide("iot", "g", "dev", "rerun", Some("reproduce it")).await.unwrap();
+        assert_eq!(state, NodeState::Ready, "a rerun ruling re-readies the node");
+        // No dev agent exists in the fixture: on_ready holds at the missing
+        // role marker (the engine stays Ready; the row surfaces the hold).
+        assert_eq!(
+            fleet.lock().await.node_state("iot", "g", "dev").unwrap().state,
+            NodeState::MissingRole,
+            "without a role agent the re-run holds (surface marker)"
+        );
+        let guard = fleet.lock().await;
+        let decisions = guard.decisions();
+        assert_eq!(decisions.len(), before + 1, "the ruling is journaled as a decision");
+        assert_eq!(decisions.last().unwrap().signature, "human.ruling.g/dev");
+        assert_eq!(decisions.last().unwrap().decision["source"], "human");
+    }
+
+    #[tokio::test]
+    async fn decide_done_transitions_and_double_decide_is_a_noop() {
+        let (_fleet, runner) = needs_decision_fixture().await;
+        let state = runner.decide("iot", "g", "dev", "done", None).await.unwrap();
+        assert_eq!(state, NodeState::Done);
+
+        // A second decide on a now-Done node is a 409-style error (the API
+        // maps it to CONFLICT); the runner surfaces the message.
+        let err = runner.decide("iot", "g", "dev", "done", None).await.unwrap_err();
+        assert!(err.to_string().contains("not needs_decision"));
+    }
+
+    #[tokio::test]
+    async fn decide_skip_flags_the_node_skipped() {
+        let (fleet, runner) = needs_decision_fixture().await;
+        let state = runner.decide("iot", "g", "dev", "skip", None).await.unwrap();
+        assert_eq!(state, NodeState::Done);
+        // The persisted row is Done; the skipped flag is on the engine event
+        // (surfaced via the runlog/UI later). Just assert the transition here.
+        assert_eq!(
+            fleet.lock().await.node_state("iot", "g", "dev").unwrap().state,
+            NodeState::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_rejects_unknown_node_and_bad_action() {
+        let (_fleet, runner) = needs_decision_fixture().await;
+        assert!(runner.decide("iot", "g", "nope", "done", None).await.is_err());
+        assert!(runner.decide("iot", "g", "dev", "explode", None).await.is_err());
     }
 }

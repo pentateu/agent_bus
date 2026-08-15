@@ -166,6 +166,24 @@ impl WorkspaceManager {
         Ok(chosen)
     }
 
+    /// A3: adopt an existing cmux workspace with our name (it survives a
+    /// daemon restart — cmux owns the persistent workspace), else create it.
+    /// The adopted handle is recorded exactly like a created one (the
+    /// workspace upsert below carries `cmux_ws`, so `off()` closes it too —
+    /// locked decision 4: after adoption the supervisor owns it).
+    async fn adopt_or_create_cmux(&self, ws_id: &str, project: &Path) -> Result<CmuxHandle> {
+        if let Ok(workspaces) = self.cmux.list_workspaces().await
+            && let Some(found) = workspaces.into_iter().find(|w| w.name.as_deref() == Some(ws_id))
+        {
+            tracing::info!(ws = ws_id, handle = %found.id, "adopting existing cmux workspace");
+            return Ok(found.id);
+        }
+        self.cmux
+            .new_workspace(ws_id, project)
+            .await
+            .with_context(|| format!("cmux new-workspace for {ws_id}"))
+    }
+
     /// Idempotent bring-up (§4.3 `on`).
     ///
     /// # Errors
@@ -247,11 +265,7 @@ impl WorkspaceManager {
             port = self.ensure_server(ws_id, &workspace.path, recorded, port).await?;
         }
 
-        let cmux_ws = self
-            .cmux
-            .new_workspace(ws_id, Path::new(&workspace.path))
-            .await
-            .with_context(|| format!("cmux new-workspace for {ws_id}"))?;
+        let cmux_ws = self.adopt_or_create_cmux(ws_id, Path::new(&workspace.path)).await?;
 
         let client = OpencodeClient::new(port, &self.secret)?;
         self.wait_for_health(&client).await?;
@@ -840,5 +854,112 @@ mod tests {
         assert_eq!(adopt_or_kill(true, false), AdoptOrKill::Kill, "recycled PID must be killed");
         assert_eq!(adopt_or_kill(false, true), AdoptOrKill::Kill, "no health → kill");
         assert_eq!(adopt_or_kill(false, false), AdoptOrKill::Kill);
+    }
+
+    /// A recording fake: `new_workspace` stores by name so `list_workspaces`
+    /// returns it on the next call (models cmux's persistent workspaces).
+    #[derive(Default)]
+    struct RecordingCmux {
+        workspaces: std::sync::Mutex<Vec<crate::clients::cmux::CmuxWorkspace>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::clients::cmux::CmuxClient for RecordingCmux {
+        async fn ping(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn list_workspaces(&self) -> Result<Vec<crate::clients::cmux::CmuxWorkspace>> {
+            Ok(self.workspaces.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone())
+        }
+        async fn new_workspace(&self, name: &str, _cwd: &Path) -> Result<CmuxHandle> {
+            let handle = format!("workspace:{name}");
+            self.workspaces.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(
+                crate::clients::cmux::CmuxWorkspace {
+                    id: handle.clone(),
+                    name: Some(name.to_owned()),
+                },
+            );
+            Ok(handle)
+        }
+        async fn new_surface(&self, ws: &CmuxHandle, _wd: &Path) -> Result<CmuxHandle> {
+            Ok(format!("surface:{ws}"))
+        }
+        async fn send_cmd(&self, _ws: &CmuxHandle, _s: &CmuxHandle, _text: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn focus_pane(&self, _ws: &CmuxHandle, _p: &CmuxHandle) -> Result<()> {
+            Ok(())
+        }
+        async fn select_workspace(&self, _ws: &CmuxHandle) -> Result<()> {
+            Ok(())
+        }
+        async fn close_surface(&self, _ws: &CmuxHandle, _s: &CmuxHandle) -> Result<()> {
+            Ok(())
+        }
+        async fn close_workspace(&self, ws: &CmuxHandle) -> Result<()> {
+            self.workspaces
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|w| &w.id != ws);
+            Ok(())
+        }
+        async fn read_screen(&self, _ws: &CmuxHandle, _s: &CmuxHandle) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn send(&self, _ws: &CmuxHandle, _s: &CmuxHandle, _text: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn send_key(&self, _ws: &CmuxHandle, _s: &CmuxHandle, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn notify(&self, _ws: &CmuxHandle, _t: &str, _b: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn manager_with(cmux: Arc<dyn crate::clients::cmux::CmuxClient>) -> WorkspaceManager {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet = std::sync::Arc::new(AsyncMutex::new(Fleet::open(dir.path()).unwrap()));
+        WorkspaceManager::new(ManagerDeps {
+            fleet,
+            cmux,
+            bus: crate::bus::shared(),
+            opencode_bin: "opencode".to_owned(),
+            graceful_timeout: Duration::from_secs(1),
+            secret: "secret".to_owned(),
+            shutdown: CancellationToken::new(),
+            allocator: supervisor_core::PortAllocator::default_allocator(),
+        })
+    }
+
+    #[tokio::test]
+    async fn cmux_workspace_is_adopted_not_duplicated() {
+        // A3: on() twice must result in exactly one cmux workspace — the
+        // second on() adopts the existing one instead of calling
+        // new_workspace again.
+        let cmux = Arc::new(RecordingCmux::default());
+        let manager = manager_with(cmux.clone());
+        let path = std::path::Path::new("/x/iot");
+
+        let first = manager.adopt_or_create_cmux("iot", path).await.unwrap();
+        let second = manager.adopt_or_create_cmux("iot", path).await.unwrap();
+
+        assert_eq!(first, second, "the same handle is adopted, not re-created");
+        let listed = cmux.list_workspaces().await.unwrap();
+        assert_eq!(listed.len(), 1, "exactly one cmux workspace for the workspace");
+        assert_eq!(listed[0].name.as_deref(), Some("iot"));
+    }
+
+    #[tokio::test]
+    async fn adopted_cmux_workspace_is_closed_on_off() {
+        // Locked decision 4: after adoption the supervisor owns the cmux
+        // workspace, so off() closes it.
+        let cmux = Arc::new(RecordingCmux::default());
+        let manager = manager_with(cmux.clone());
+        let handle =
+            manager.adopt_or_create_cmux("iot", std::path::Path::new("/x/iot")).await.unwrap();
+        assert_eq!(cmux.list_workspaces().await.unwrap().len(), 1);
+        manager.cmux.close_workspace(&handle).await.unwrap();
+        assert_eq!(cmux.list_workspaces().await.unwrap().len(), 0, "adopted workspace closes");
     }
 }

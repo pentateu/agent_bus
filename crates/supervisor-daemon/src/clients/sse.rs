@@ -197,18 +197,17 @@ impl SseObserver {
         };
         // No short total timeout on the stream: the connection is infinite by
         // design and the heartbeat watchdog below (HEARTBEAT_TIMEOUT_SECS)
-        // handles stalls. A 120s cap (longer than the 90s heartbeat window)
-        // keeps the client's 30s default from forcing a reconnect every 30s
-        // (review C-3).
-        let res =
-            match self.client.http_client().get(url).timeout(Duration::from_mins(2)).send().await {
-                Ok(res) => res,
-                Err(e) => {
-                    tracing::warn!(ws = %self.ws, error = %e, "sse connect failed; reconnecting");
-                    *backoff = grow_backoff(*backoff);
-                    return;
-                }
-            };
+        // Use the dedicated SSE client: connect timeout only, NO total
+        // timeout — the heartbeat watchdog owns liveness (a total timeout
+        // severed the stream every 30s/120s; review minor).
+        let res = match self.client.sse_client().get(url).send().await {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::warn!(ws = %self.ws, error = %e, "sse connect failed; reconnecting");
+                *backoff = grow_backoff(*backoff);
+                return;
+            }
+        };
         if !res.status().is_success() {
             tracing::warn!(ws = %self.ws, status = %res.status(), "sse non-200; reconnecting");
             *backoff = grow_backoff(*backoff);

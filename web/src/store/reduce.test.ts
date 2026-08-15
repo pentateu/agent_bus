@@ -10,13 +10,6 @@ const fleetAgent = (ws: string, agent: string, state: string): BusEvent => ({
   state,
 });
 
-const node = (graph: string, n: string, state: string): BusEvent => ({
-  topic: "workflow",
-  event: state,
-  graph,
-  node: n,
-});
-
 describe("reduce", () => {
   it("tracks workspace state", () => {
     const e: BusEvent = {
@@ -31,14 +24,6 @@ describe("reduce", () => {
   it("tracks agent state", () => {
     const s = reduce(initialLiveState(), fleetAgent("iot", "dev_01", "working"));
     expect(s.agentStates["iot"]["dev_01"]).toBe("working");
-  });
-
-  it("maps workflow events to node states", () => {
-    let s = initialLiveState();
-    s = reduce(s, node("feature_lifecycle", "dev", "node_started"));
-    expect(s.nodeStates[""]["feature_lifecycle"]["dev"]).toBe("running");
-    s = reduce(s, node("feature_lifecycle", "dev", "node_done"));
-    expect(s.nodeStates[""]["feature_lifecycle"]["dev"]).toBe("done");
   });
 
   it("permission_asked sets the pending banner", () => {

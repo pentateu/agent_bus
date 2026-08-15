@@ -377,8 +377,12 @@ impl WorkflowRunner {
     /// finding 1). Returns whether anything matched. Testable without a
     /// driver: callers feed the text in.
     async fn apply_match_fallback(&self, ws: &str, tasks: &[RunningTask], text: &str) -> bool {
-        let graphs: std::collections::BTreeSet<String> =
-            tasks.iter().map(|(g, _)| g.clone()).collect();
+        let mut graphs: Vec<String> = Vec::new();
+        for (g, _) in tasks.iter().rev() {
+            if !graphs.contains(g) {
+                graphs.push(g.clone());
+            }
+        }
         let mut matched = false;
         for graph in graphs {
             let events = {
@@ -389,12 +393,16 @@ impl WorkflowRunner {
                 };
                 instance.apply_match(text)
             };
-            if !events.is_empty() {
-                matched = true;
+            if events.is_empty() {
+                continue;
             }
+            matched = true;
             for event in events {
                 self.handle_event(ws, event).await;
             }
+            // I-4 residual: one match belongs to one task — stop after the
+            // first graph that actually matches (same as the ACK path).
+            break;
         }
         matched
     }

@@ -19,12 +19,18 @@ use crate::bus::Receiver;
 use crate::clients::registry::DriverRegistry;
 use crate::state::Fleet;
 
+/// F-7: how many consecutive delivery failures dead-letter an entry (stops
+/// the head-of-queue retry storm and lets later entries flow).
+const DELIVERY_MAX_FAILURES: u32 = 5;
+
 /// The inbox delivery service.
 pub struct InboxService {
     fleet: Arc<AsyncMutex<Fleet>>,
     drivers: Arc<DriverRegistry>,
     bus: crate::bus::SharedBus,
     shutdown: CancellationToken,
+    /// F-7: in-memory per-entry delivery failure counts (dead-letter guard).
+    failed_deliveries: std::sync::Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl InboxService {
@@ -36,7 +42,13 @@ impl InboxService {
         bus: crate::bus::SharedBus,
         shutdown: CancellationToken,
     ) -> Self {
-        Self { fleet, drivers, bus, shutdown }
+        Self {
+            fleet,
+            drivers,
+            bus,
+            shutdown,
+            failed_deliveries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     /// Run the delivery loop until shutdown.
@@ -112,7 +124,32 @@ impl InboxService {
             }
             let mut undelivered = fleet.undelivered(ws, agent);
             undelivered.sort_by_key(|e| (e.priority != Priority::High, e.created_at.clone()));
-            undelivered.into_iter().next().cloned()
+            // F-7: a permanently-failing entry (e.g. an unimplemented cmux
+            // driver) must not block the whole queue forever. Once an entry
+            // has failed DELIVERY_MAX_FAILURES times it is dead-lettered: we
+            // stop retrying it (and log once) so later entries can flow.
+            undelivered
+                .into_iter()
+                .find(|e| {
+                    let failures = self
+                        .failed_deliveries
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&e.id)
+                        .copied()
+                        .unwrap_or(0);
+                    if failures >= DELIVERY_MAX_FAILURES {
+                        tracing::error!(
+                            ws, agent, entry = %e.id,
+                            failures,
+                            "dead-lettered: delivery keeps failing; skipping"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .cloned()
         };
         let Some(entry) = next else { return Ok(()) };
         self.deliver(&entry).await
@@ -120,14 +157,34 @@ impl InboxService {
 
     /// Deliver one entry through the driver and mark it delivered on success.
     async fn deliver(&self, entry: &InboxEntry) -> Result<()> {
-        let (driver, agent_ref) =
-            self.drivers.for_agent(&entry.workspace_id, &entry.agent_id).await.with_context(
-                || format!("resolve driver for {}/{}", entry.workspace_id, entry.agent_id),
-            )?;
-        driver
-            .send(&agent_ref, &entry.body, None)
-            .await
-            .with_context(|| format!("deliver to {}/{}", entry.workspace_id, entry.agent_id))?;
+        let send_result = async {
+            let (driver, agent_ref) =
+                self.drivers.for_agent(&entry.workspace_id, &entry.agent_id).await.with_context(
+                    || format!("resolve driver for {}/{}", entry.workspace_id, entry.agent_id),
+                )?;
+            driver
+                .send(&agent_ref, &entry.body, None)
+                .await
+                .with_context(|| format!("deliver to {}/{}", entry.workspace_id, entry.agent_id))
+        }
+        .await;
+        match send_result {
+            Ok(_) => {
+                self.failed_deliveries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&entry.id);
+            }
+            Err(e) => {
+                let mut failures = self
+                    .failed_deliveries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *failures.entry(entry.id.clone()).or_insert(0) += 1;
+                drop(failures);
+                return Err(e);
+            }
+        }
         let delivered_at = supervisor_core::now_rfc3339();
         {
             let mut fleet = self.fleet.lock().await;

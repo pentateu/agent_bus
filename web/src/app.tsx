@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { LiveProvider, useLive } from "./store/live-store";
-import { hasToken } from "./api/client";
+import { hasToken, onTokenChange } from "./api/client";
 import { Dashboard } from "./pages/Dashboard";
 import { AgentDialog } from "./pages/Agent";
 import { Graphs } from "./pages/Graphs";
@@ -24,12 +24,17 @@ function parseRoute(): { page: string; ws?: string; agent?: string; graph?: stri
 
 function Shell() {
   const [route, setRoute] = useState(parseRoute);
+  // F-4: re-render when the token clears (401) so the missing-token gate
+  // appears immediately instead of on the next nav/SSE event.
+  const [tokenVersion, setTokenVersion] = useState(0);
+  useEffect(() => onTokenChange(() => setTokenVersion((v) => v + 1)), []);
   useEffect(() => {
     const onChange = () => setRoute(parseRoute());
     window.addEventListener("hashchange", onChange);
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
   void useLive();
+  void tokenVersion;
 
   if (!hasToken()) {
     return (

@@ -34,6 +34,10 @@ const ROLE_GLYPH: Record<string, string> = {
 
 const NODE_W = 180;
 const NODE_H = 64;
+// A stable empty-state object: `?? {}` created a fresh object every render,
+// which invalidated the editSeed memo and re-ran the re-seed effect each
+// render (pre-existing review minor).
+const EMPTY_STATES: Record<string, never> = {};
 
 export interface WorkflowCanvasProps {
   graph: GraphDef;
@@ -108,7 +112,7 @@ function toFlow(
 
 export function WorkflowCanvas(props: WorkflowCanvasProps) {
   const { graph, mode, nodeStates, agentStates, onNodeClick, onChange, compact } = props;
-  const states = nodeStates ?? {};
+  const states = nodeStates ?? EMPTY_STATES;
   const agentStateMap = agentStates ?? {};
 
   const layout = useMemo(() => (mode === "live" ? layoutGraph(graph, NODE_W, NODE_H) : undefined), [graph, mode]);
@@ -144,14 +148,21 @@ export function WorkflowCanvas(props: WorkflowCanvasProps) {
   // C-6: backspace removal used to update only React Flow's internal state —
   // the parent graph kept the node, it reappeared on the next re-seed, and
   // save persisted the "deleted" node. Route `remove` changes to onChange.
+  // F-2: fold a batch of removals into ONE onChange applied sequentially to
+  // the accumulated graph (each change used to rebuild from the same stale
+  // `graph` prop, so box-delete resurrected all but the last node).
   const onNodesChangeEdit: import("@xyflow/react").OnNodesChange<Node<CardData>> = (changes) => {
     onNodesChange(changes);
     if (!onChange) return;
+    let next = graph;
+    let dirty = false;
     for (const change of changes) {
       if (change.type === "remove" && change.id) {
-        onChange(removeNode(graph, change.id));
+        next = removeNode(next, change.id);
+        dirty = true;
       }
     }
+    if (dirty) onChange(next);
   };
   const onEdgesDeleteEdit = (deleted: Edge[]) => {
     if (!onChange) return;

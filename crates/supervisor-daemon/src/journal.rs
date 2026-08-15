@@ -39,16 +39,15 @@ impl Journal {
                 .with_context(|| format!("creating journal dir {}", parent.display()))?;
         }
         // I-32: journal lines contain pasted secrets (inbox bodies); the file
-        // must be 0600, not the default umask 0644.
+        // must be 0600, not the default umask 0644. Force it every open —
+        // `.permissions().set_mode()` mutates a copy (F-3).
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
             .open(path)
             .with_context(|| format!("opening journal {}", path.display()))?;
-        if let Ok(metadata) = file.metadata() {
-            metadata.permissions().set_mode(0o600);
-        }
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("reading journal {}", path.display()))?;
         let next_seq =

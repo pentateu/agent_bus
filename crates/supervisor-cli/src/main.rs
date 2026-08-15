@@ -304,7 +304,9 @@ fn stop(cli: &Cli) -> Result<()> {
         .status()
         .is_ok_and(|s| s.success());
     if !alive {
-        anyhow::bail!("daemon not running (pid {pid} is gone; stale pid file)");
+        // F-5: remove the stale file so the next `stop` is clean.
+        let _ = std::fs::remove_file(&pid_path);
+        anyhow::bail!("daemon not running (pid {pid} is gone; stale pid file removed)");
     }
     // I-12: a recycled PID (or a planted file) must not be SIGTERMed. Verify
     // the process identity before signaling.
@@ -315,8 +317,10 @@ fn stop(cli: &Cli) -> Result<()> {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_default();
     if !identity.trim().contains("supervisor-daemon") {
+        // F-5: a planted/foreign pid file is not ours; remove it.
+        let _ = std::fs::remove_file(&pid_path);
         anyhow::bail!(
-            "pid {pid} is not a supervisor-daemon process ({identity:?}); refusing to signal"
+            "pid {pid} is not a supervisor-daemon process ({identity:?}); refusing to signal (pid file removed)"
         );
     }
 

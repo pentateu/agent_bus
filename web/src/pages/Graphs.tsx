@@ -10,7 +10,9 @@ const ROLE_PALETTE = ["dev", "reviewer", "tester", "designer", "memory-keeper"];
 function useGraphNodeStates(graphId: string | undefined): Record<string, import("../api/types").NodeState> {
   const { data } = useQuery({
     queryKey: ["graphNodes", graphId],
-    queryFn: () => api.graphNodes(graphId ?? undefined, graphId ?? ""),
+    // F-1: ws is the first arg — the graph id must go in the id position.
+    // Passing it as ws returned zero rows and the live canvas stayed blank.
+    queryFn: () => api.graphNodes(undefined, graphId ?? ""),
     refetchInterval: 2000,
     enabled: !!graphId,
   });

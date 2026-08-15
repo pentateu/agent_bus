@@ -6,6 +6,7 @@
 //! the journal if the two ever disagree (§10). A single owned `Connection`
 //! behind a mutex keeps footprint minimal.
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -275,11 +276,13 @@ impl Store {
         }
         let conn =
             Connection::open(path).with_context(|| format!("opening store {}", path.display()))?;
-        // I-32: the DB mirrors journal contents; 0600 (the file may predate
-        // this fix, so force it every open).
-        if let Ok(metadata) = std::fs::metadata(path) {
-            use std::os::unix::fs::PermissionsExt as _;
-            metadata.permissions().set_mode(0o600);
+        // I-32/F-3: the DB mirrors journal contents; force 0600 on the DB and
+        // both WAL sidecars (`<db>-wal`, `<db>-shm`). `.permissions().set_mode()`
+        // mutated a copy and was a no-op — this writes the mode back.
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let shm = std::path::PathBuf::from(format!("{}-shm", path.display()));
+        for p in [path, &wal, &shm] {
+            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
         }
         conn.execute_batch(SCHEMA).context("migrating store schema")?;
         Ok(Self { conn: Mutex::new(conn) })

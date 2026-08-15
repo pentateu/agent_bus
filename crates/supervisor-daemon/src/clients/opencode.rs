@@ -72,6 +72,10 @@ impl SessionStatusRow {
 pub struct OpencodeClient {
     base: Url,
     client: reqwest::Client,
+    /// The SSE stream client: connect timeout only, NO total timeout — the
+    /// observer's heartbeat watchdog owns liveness (a total timeout would
+    /// sever the stream every 30s/120s; review minor).
+    sse_client: reqwest::Client,
 }
 
 impl OpencodeClient {
@@ -91,21 +95,28 @@ impl OpencodeClient {
         );
         // Explicit timeouts (review C-3): a hung `opencode serve` must fail a
         // call, not block the caller forever (which previously let SSE frames
-        // pile up and Lagged every subscriber). The SSE /event stream gets its
-        // own long read timeout below.
+        // pile up and Lagged every subscriber). The SSE /event stream gets a
+        // dedicated client with NO total timeout below — the observer's
+        // heartbeat watchdog owns its liveness.
         let client = reqwest::Client::builder()
-            .default_headers(headers)
+            .default_headers(headers.clone())
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("building reqwest client")?;
-        Ok(Self { base, client })
+        let sse_client = reqwest::Client::builder()
+            .default_headers(headers)
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .context("building sse client")?;
+        Ok(Self { base, client, sse_client })
     }
 
     /// A client over a caller-supplied reqwest client (for tests / proxies).
     #[must_use]
     pub fn with_client(base: Url, client: reqwest::Client) -> Self {
-        Self { base, client }
+        let sse_client = client.clone();
+        Self { base, client, sse_client }
     }
 
     /// GET /global/health. `Ok(false)` when the server answers non-200.
@@ -284,6 +295,13 @@ impl OpencodeClient {
     #[must_use]
     pub fn http_client(&self) -> &reqwest::Client {
         &self.client
+    }
+
+    /// The SSE stream client: connect timeout only, no total timeout (the
+    /// observer's heartbeat watchdog owns liveness — review minor).
+    #[must_use]
+    pub fn sse_client(&self) -> &reqwest::Client {
+        &self.sse_client
     }
 }
 

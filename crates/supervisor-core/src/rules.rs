@@ -368,8 +368,13 @@ impl Condition {
                         for (k, v) in agent {
                             match k.as_str() {
                                 "role" | "type" => {
+                                    // I-23 residual: a wrong-typed value
+                                    // (`role = 123`) must disable the rule,
+                                    // not silently match everything.
                                     if let Some(cmp) = parse_str_cmp(v) {
                                         cond.agent_role = Some(cmp);
+                                    } else {
+                                        cond.unknown_keys.push(format!("agent.{k}"));
                                     }
                                 }
                                 other => cond.unknown_keys.push(format!("agent.{other}")),

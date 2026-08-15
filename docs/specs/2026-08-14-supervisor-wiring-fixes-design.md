@@ -358,6 +358,13 @@ Then extend the **web UI design** (`2026-08-14-supervisor-webui-detailed-design.
 acceptance with a `supervisor smoke` that proves on→inbox→idle→ACK→apply live
 (needs F1–F5).
 
+> **Deviation recorded (F-6, 2026-08-15):** `supervisor smoke` does NOT build
+> its own scratch workspace + background agents; it operates on a
+> caller-supplied workspace (run `supervisor add` / `on` first). It asserts
+> hops 1–4 (on, start, deliver→Running, ACK→Done) and fails on a re-run
+> (`already_running`); hop 5 (next node Ready) is reported, not asserted.
+> The scratch-fixture harness is deferred with the Graph Engine v2 cycle.
+
 ## 14. Test expectations
 
 - Every fix has a unit test in its crate and an integration test against a real

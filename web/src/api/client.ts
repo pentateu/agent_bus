@@ -3,9 +3,20 @@
 // variable — never persisted.
 
 let token: string | null = null;
+// F-4: the token is module state, but the UI gate must react when it clears
+// (a rotated token 401s → clear → the missing-token screen, not a dead
+// dashboard). Subscribers are notified on change.
+const listeners = new Set<() => void>();
 
 export function setToken(t: string | null) {
   token = t;
+  for (const cb of listeners) cb();
+}
+
+/** F-4: subscribe to token changes; returns an unsubscribe fn. */
+export function onTokenChange(cb: () => void): () => void {
+  listeners.add(cb);
+  return () => listeners.delete(cb);
 }
 
 export function hasToken(): boolean {

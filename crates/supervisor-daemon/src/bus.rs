@@ -86,7 +86,7 @@ impl Receiver {
                 Err(RecvError::Lagged(n)) => {
                     tracing::warn!(dropped = n, "bus subscriber fell behind; resyncing");
                 }
-                Err(RecvError::Closed) | Err(RecvError::Empty) => return None,
+                Err(RecvError::Closed | RecvError::Empty) => return None,
             }
         }
     }

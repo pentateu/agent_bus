@@ -201,8 +201,7 @@ impl SseObserver {
         // keeps the client's 30s default from forcing a reconnect every 30s
         // (review C-3).
         let res =
-            match self.client.http_client().get(url).timeout(Duration::from_secs(120)).send().await
-            {
+            match self.client.http_client().get(url).timeout(Duration::from_mins(2)).send().await {
                 Ok(res) => res,
                 Err(e) => {
                     tracing::warn!(ws = %self.ws, error = %e, "sse connect failed; reconnecting");

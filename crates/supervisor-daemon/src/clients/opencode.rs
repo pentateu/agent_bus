@@ -89,8 +89,14 @@ impl OpencodeClient {
             reqwest::header::HeaderValue::from_str(&format!("Basic {credentials}"))
                 .context("build basic auth header")?,
         );
+        // Explicit timeouts (review C-3): a hung `opencode serve` must fail a
+        // call, not block the caller forever (which previously let SSE frames
+        // pile up and Lagged every subscriber). The SSE /event stream gets its
+        // own long read timeout below.
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("building reqwest client")?;
         Ok(Self { base, client })

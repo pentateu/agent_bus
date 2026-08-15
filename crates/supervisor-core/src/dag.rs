@@ -664,7 +664,11 @@ impl Workflow {
     }
 
     /// Loop a human gate back: re-ready `target` and reset everything that
-    /// transitively depends on it so the chain re-runs.
+    /// transitively depends on it so the chain re-runs. Every strictly-
+    /// downstream node is reset to `Pending` — including one already `Done`
+    /// (review C-4): with `loop_back.big` targeting an earlier design node,
+    /// the agent-review node between it and the gate must re-run, or the
+    /// human reviews a redesign that was never re-reviewed.
     fn loop_back(&mut self, node: &str, target: &str, revision: Revision) -> Vec<WorkflowEvent> {
         let mut events = vec![WorkflowEvent::LoopBack {
             graph: self.graph.id.clone(),
@@ -674,7 +678,7 @@ impl Workflow {
         }];
         let downstream = reachable_from(self, target);
         for dep in downstream {
-            if dep != target && matches!(self.states[&dep], NodeState::Ready | NodeState::Running) {
+            if dep != target {
                 self.states.insert(dep.clone(), NodeState::Pending);
             }
         }
@@ -1185,6 +1189,77 @@ mod tests {
             "big revision re-readies the review"
         );
         assert_eq!(wf.state("gate"), Some(NodeState::Pending), "gate waits on the re-run review");
+    }
+
+    #[test]
+    fn shipped_shape_big_revision_resets_the_done_review_node() {
+        // The shipped feature_lifecycle shape (review C-4): brainstorm →
+        // high_level_design → hl_agent_review → hl_human_gate, with the gate
+        // looping `big` back to high_level_design. With every node Done, a
+        // big-revision rejection must reset hl_agent_review to Pending so the
+        // redesign is agent-reviewed again before the human sees it.
+        let brainstorm = node("brainstorm", "designer", &[], "brainstorm.done");
+        let design =
+            node("high_level_design", "designer", &["brainstorm"], "high_level_design.done");
+        let review =
+            node("hl_agent_review", "reviewer", &["high_level_design"], "hl_agent_review.done");
+        let gate = NodeDef {
+            done_when: DoneWhen {
+                ack: Some("hl_human_gate".to_owned()),
+                approved: Some(true),
+                ..DoneWhen::default()
+            },
+            loop_back: Some(LoopBack {
+                on: "needs_revision".to_owned(),
+                small: "hl_human_gate".to_owned(),
+                big: "high_level_design".to_owned(),
+            }),
+            ..node("hl_human_gate", "designer", &["hl_agent_review"], "gate")
+        };
+        let mut wf = Workflow::new(GraphDef {
+            id: "feature_lifecycle".to_owned(),
+            name: "shape".to_owned(),
+            nodes: vec![brainstorm, design, review, gate],
+        })
+        .unwrap();
+        // Run the chain up to the gate (all done except the running gate).
+        for node_id in ["brainstorm", "high_level_design", "hl_agent_review"] {
+            wf.start(node_id).unwrap();
+            let _ = wf.apply_ack(&Ack {
+                task_id: format!("{node_id}.done"),
+                status: AckStatus::Done,
+                summary: None,
+                approved: Some(true),
+                needs_revision: None,
+            });
+        }
+        wf.start("hl_human_gate").unwrap();
+        assert_eq!(wf.state("hl_agent_review"), Some(NodeState::Done));
+        // The gate's agent returns a big-revision rejection: back to the
+        // design, and the done review node must re-run before the human sees
+        // the redesign.
+        let _ = wf.apply_ack(&Ack {
+            task_id: "hl_human_gate".to_owned(),
+            status: AckStatus::Done,
+            summary: None,
+            approved: Some(false),
+            needs_revision: Some(Revision::Big),
+        });
+        assert_eq!(
+            wf.state("high_level_design"),
+            Some(NodeState::Ready),
+            "big revision re-readies the design"
+        );
+        assert_eq!(
+            wf.state("hl_agent_review"),
+            Some(NodeState::Pending),
+            "the done review node must re-run before the human sees the redesign"
+        );
+        assert_eq!(
+            wf.state("hl_human_gate"),
+            Some(NodeState::Pending),
+            "the gate waits for the re-review"
+        );
     }
 
     #[test]

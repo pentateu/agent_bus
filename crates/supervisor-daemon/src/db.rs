@@ -220,6 +220,25 @@ impl Store {
                     self.set_decision_outcome(id, outcome)?;
                 }
             }
+            JournalType::ProposalRecord => {
+                if let Ok(p) =
+                    serde_json::from_value::<supervisor_core::types::Proposal>(record.data.clone())
+                {
+                    self.upsert_proposal(&p)?;
+                }
+            }
+            JournalType::IntakeRecord => {
+                if let Ok(item) = serde_json::from_value::<IntakeItem>(record.data.clone()) {
+                    self.insert_intake(&item)?;
+                }
+            }
+            JournalType::UsageRecord => {
+                if let Ok(row) =
+                    serde_json::from_value::<supervisor_core::types::UsageRow>(record.data.clone())
+                {
+                    self.insert_usage(&row)?;
+                }
+            }
         }
         self.journal_row(record)
     }
@@ -809,7 +828,7 @@ impl Store {
     pub fn insert_intake(&self, item: &IntakeItem) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         conn.execute(
-            "INSERT INTO intake (id, source, kind, title, body, severity, refs, graph_id, received_at)
+            "INSERT OR REPLACE INTO intake (id, source, kind, title, body, severity, refs, graph_id, received_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 item.id,

@@ -156,14 +156,40 @@ fn exit_unreachable() -> ExitCode {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // C-5: clap's default usage-error exit is 2; the documented contract
+    // (§4.15) says usage errors exit 1.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let _ = e.print();
+            return ExitCode::from(1);
+        }
+    };
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("supervisor: {e:#}");
-            ExitCode::from(1)
+            ExitCode::from(exit_code(&e))
         }
     }
+}
+
+/// Map an error to the documented exit code (§4.15): 1 general/usage,
+/// 2 target not found (API 404), 3 daemon unreachable (connect failure).
+/// The CLI's slash commands branch on these to self-heal (review C-5).
+fn exit_code(err: &anyhow::Error) -> u8 {
+    for cause in err.chain() {
+        if let Some(f) = cause.downcast_ref::<crate::client::ApiFailure>() {
+            return if f.status == 404 { 2 } else { 1 };
+        }
+        if cause.downcast_ref::<crate::client::DaemonUnreachable>().is_some() {
+            return 3;
+        }
+        if cause.downcast_ref::<crate::client::TargetNotFound>().is_some() {
+            return 2;
+        }
+    }
+    1
 }
 
 fn run(cli: &Cli) -> Result<()> {
@@ -273,6 +299,19 @@ fn stop(cli: &Cli) -> Result<()> {
         .is_ok_and(|s| s.success());
     if !alive {
         anyhow::bail!("daemon not running (pid {pid} is gone; stale pid file)");
+    }
+    // I-12: a recycled PID (or a planted file) must not be SIGTERMed. Verify
+    // the process identity before signaling.
+    let identity = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    if !identity.trim().contains("supervisor-daemon") {
+        anyhow::bail!(
+            "pid {pid} is not a supervisor-daemon process ({identity:?}); refusing to signal"
+        );
     }
 
     println!("stopping supervisor daemon (pid {pid})…");
@@ -439,6 +478,11 @@ fn rules(cli: &Cli, action: &RulesAction) -> Result<()> {
 }
 
 fn bake_back(cli: &Cli, preview: bool, apply: Option<&str>, reject: Option<&str>) -> Result<()> {
+    // I-20: a bare `supervisor bake-back` silently did nothing. Require one
+    // of the actions.
+    if !preview && apply.is_none() && reject.is_none() {
+        anyhow::bail!("bake-back requires one of --preview, --apply <id>, or --reject <id>");
+    }
     let client = cli.client().map_err(|c| anyhow::anyhow!("daemon unreachable ({c:?})"))?;
     if let Some(id) = apply {
         let result = client.apply_proposal(id)?;
@@ -500,11 +544,13 @@ fn dag(cli: &Cli, action: &DagAction) -> Result<()> {
         }
         DagAction::Status { id } => {
             let graphs = client.graphs()?;
+            let mut found = id.is_none();
             for graph in graphs {
                 let gid = graph["id"].as_str().unwrap_or_default();
                 if id.as_deref().is_some_and(|want| want != gid) {
                     continue;
                 }
+                found = true;
                 println!("graph {gid}");
                 if let Ok(nodes) = client.graph_nodes(gid) {
                     for node in &nodes {
@@ -516,6 +562,10 @@ fn dag(cli: &Cli, action: &DagAction) -> Result<()> {
                         );
                     }
                 }
+            }
+            // I-20: an unknown graph id must not exit 0 silently.
+            if !found && let Some(want) = id {
+                anyhow::bail!(crate::client::TargetNotFound(format!("unknown graph {want}")));
             }
         }
     }
@@ -534,10 +584,13 @@ fn web(cli: &Cli) -> Result<()> {
     let config = cli.client_config()?;
     let url = format!("{}/ui/#token={}", config.base, config.token);
     let opened = std::process::Command::new("open").arg(&url).status().is_ok_and(|s| s.success());
+    // I-33: never print the bearer token to the terminal (scrollback, screen
+    // recording, wrapper logs). Show the base URL only.
+    let display = format!("{}/ui/", config.base);
     if opened {
-        println!("opened {url}");
+        println!("opened the supervisor web UI at {display}");
     } else {
-        println!("open the UI at:\n{url}");
+        println!("open the UI at:\n{display}");
     }
     Ok(())
 }

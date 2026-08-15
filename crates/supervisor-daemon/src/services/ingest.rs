@@ -91,16 +91,16 @@ impl IngestionService {
             tokio::select! {
                 () = self.shutdown.cancelled() => return,
                 _ = poll.tick() => self.poll_due_github().await,
-                event = rx.recv() => {
+                event = rx.recv_or_shutdown() => {
                     match event {
-                        Ok(BusEvent::Human(HumanEvent::Command { command, args })) if command == "start_ingest" => {
+                        Some(BusEvent::Human(HumanEvent::Command { command, args })) if command == "start_ingest" => {
                             let ws = args.first().cloned().unwrap_or_default();
                             let kind = args.get(1).cloned().unwrap_or_default();
                             let item_id = args.get(2).cloned();
                             self.start_workflow_for_kind(&ws, &kind, item_id.as_deref()).await;
                         }
-                        Ok(_) => {}
-                        Err(_) => return,
+                        Some(_) => {}
+                        None => return,
                     }
                 }
             }

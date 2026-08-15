@@ -48,10 +48,10 @@ impl InboxService {
             tokio::select! {
                 () = self.shutdown.cancelled() => return,
                 _ = sweep.tick() => self.deliver_pending().await,
-                event = rx.recv() => {
+                event = rx.recv_or_shutdown() => {
                     match event {
-                        Ok(event) => self.handle(event).await,
-                        Err(_) => return,
+                        Some(event) => self.handle(event).await,
+                        None => return,
                     }
                 }
             }

@@ -53,13 +53,13 @@ impl UsageCollector {
             tokio::select! {
                 () = self.shutdown.cancelled() => return,
                 _ = poll.tick() => self.collect_all().await,
-                event = rx.recv() => {
+                event = rx.recv_or_shutdown() => {
                     match event {
-                        Ok(BusEvent::Signal(Signal::StepEnded { ws, agent })) => {
+                        Some(BusEvent::Signal(Signal::StepEnded { ws, agent })) => {
                             self.collect(&ws, &agent).await;
                         }
-                        Ok(_) => {}
-                        Err(_) => return,
+                        Some(_) => {}
+                        None => return,
                     }
                 }
             }

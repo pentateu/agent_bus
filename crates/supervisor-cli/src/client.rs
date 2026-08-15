@@ -74,7 +74,12 @@ impl ApiClient {
 
     fn get(&self, path: &str) -> Result<serde_json::Value> {
         let url = format!("{}{path}", self.base);
-        let res = self.http.get(&url).bearer_auth(&self.token).send().context("GET {path}")?;
+        let res = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| map_send_err(e, "GET {path}"))?;
         parse(res)
     }
 
@@ -84,13 +89,13 @@ impl ApiClient {
         if let Some(body) = body {
             req = req.json(body);
         }
-        parse(req.send().context("POST {path}")?)
+        parse(req.send().map_err(|e| map_send_err(e, "POST {path}"))?)
     }
 
     fn put(&self, path: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
         let url = format!("{}{path}", self.base);
         let req = self.http.put(&url).bearer_auth(&self.token).json(body);
-        parse(req.send().context("PUT {path}")?)
+        parse(req.send().map_err(|e| map_send_err(e, "PUT {path}"))?)
     }
 
     pub fn health(&self) -> Result<serde_json::Value> {
@@ -201,7 +206,11 @@ impl ApiClient {
     }
 
     pub fn ingest(&self, source: &str, payload: &str) -> Result<serde_json::Value> {
-        let payload: serde_json::Value = serde_json::from_str(payload).unwrap_or_default();
+        // I-19: propagate a bad payload instead of silently creating an empty
+        // intake row (previously `unwrap_or_default` reported success on a
+        // typo'd payload).
+        let payload: serde_json::Value = serde_json::from_str(payload)
+            .with_context(|| format!("ingest payload is not valid JSON: {payload}"))?;
         self.post(
             "/api/v1/ingest",
             Some(&serde_json::json!({ "source": source, "payload": payload })),
@@ -209,15 +218,66 @@ impl ApiClient {
     }
 }
 
-/// Parse a response, turning non-2xx into a message.
+/// Carries an HTTP status so `main` can map it to the documented exit codes
+/// (§4.15): a 404 → exit 2 (target not found). Review C-5.
+#[derive(Debug)]
+pub struct ApiFailure {
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for ApiFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "API returned {}: {}", self.status, self.message)
+    }
+}
+
+impl std::error::Error for ApiFailure {}
+
+/// A connect-level failure (the daemon is not reachable) → exit 3. Review C-5.
+#[derive(Debug)]
+pub struct DaemonUnreachable(pub String);
+
+impl std::fmt::Display for DaemonUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "daemon unreachable: {}", self.0)
+    }
+}
+
+impl std::error::Error for DaemonUnreachable {}
+
+/// A target (workspace/graph/node) does not exist → exit 2. Review I-20.
+#[derive(Debug)]
+pub struct TargetNotFound(pub String);
+
+impl std::fmt::Display for TargetNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "not found: {}", self.0)
+    }
+}
+
+impl std::error::Error for TargetNotFound {}
+
+/// Map a reqwest send failure: a connect/timeout/request error means the
+/// daemon is unreachable (exit 3); anything else is a general failure.
+fn map_send_err(e: reqwest::Error, what: &str) -> anyhow::Error {
+    if e.is_connect() || e.is_timeout() || e.is_request() {
+        anyhow::Error::new(DaemonUnreachable(format!("{what}: {e}")))
+    } else {
+        anyhow::anyhow!("{what}: {e}")
+    }
+}
+
+/// Parse a response, turning non-2xx into a message. 404s carry the status so
+/// the CLI can exit 2 (target not found).
 fn parse(res: Response) -> Result<serde_json::Value> {
     if res.status() == StatusCode::UNAUTHORIZED {
         anyhow::bail!("unauthorized: is the API token current?");
     }
     if !res.status().is_success() {
-        let status = res.status();
+        let status = res.status().as_u16();
         let text = res.text().unwrap_or_default();
-        anyhow::bail!("API returned {status}: {text}");
+        return Err(ApiFailure { status, message: text }.into());
     }
     res.json().context("decode response")
 }

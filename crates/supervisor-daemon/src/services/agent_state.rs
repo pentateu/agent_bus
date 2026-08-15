@@ -40,11 +40,11 @@ impl AgentStateTracker {
         loop {
             tokio::select! {
                 () = self.shutdown.cancelled() => return,
-                event = rx.recv() => {
+                event = rx.recv_or_shutdown() => {
                     match event {
-                        Ok(BusEvent::Signal(signal)) => self.apply(&signal).await,
-                        Ok(_) => {}
-                        Err(_) => return,
+                        Some(BusEvent::Signal(signal)) => self.apply(&signal).await,
+                        Some(_) => {}
+                        None => return,
                     }
                 }
             }

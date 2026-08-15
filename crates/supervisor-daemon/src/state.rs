@@ -279,30 +279,39 @@ impl Fleet {
         Ok(record)
     }
 
-    /// Persist a proposal (stable across restarts).
+    /// Persist a proposal (stable across restarts). Journal-first (review
+    /// C-2): without the journal entry, `Store::rebuild` wiped proposals on
+    /// every restart.
     ///
     /// # Errors
-    /// Any projection failure.
+    /// Any journal or projection failure.
     pub fn upsert_proposal(&mut self, p: &Proposal) -> Result<()> {
+        let record = self.journal.append(JournalType::ProposalRecord, serde_json::to_value(p)?)?;
         self.state.proposals.insert(p.id.clone(), p.clone());
-        self.store.upsert_proposal(p)
+        self.store.upsert_proposal(p)?;
+        self.store.journal_row(&record)
     }
 
-    /// Insert an intake item.
+    /// Insert an intake item. Journal-first (review C-2).
     ///
     /// # Errors
-    /// Any projection failure.
+    /// Any journal or projection failure.
     pub fn insert_intake(&mut self, item: &IntakeItem) -> Result<()> {
+        let record = self.journal.append(JournalType::IntakeRecord, serde_json::to_value(item)?)?;
         self.state.intake.push_back(item.clone());
-        self.store.insert_intake(item)
+        self.store.insert_intake(item)?;
+        self.store.journal_row(&record)
     }
 
-    /// Insert a usage row (U5, idempotent by id).
+    /// Insert a usage row (U5, idempotent by id). Journal-first (review C-2)
+    /// so usage/cost data survives restarts.
     ///
     /// # Errors
-    /// Any projection failure.
+    /// Any journal or projection failure.
     pub fn insert_usage(&mut self, row: &supervisor_core::types::UsageRow) -> Result<()> {
-        self.store.insert_usage(row)
+        let record = self.journal.append(JournalType::UsageRecord, serde_json::to_value(row)?)?;
+        self.store.insert_usage(row)?;
+        self.store.journal_row(&record)
     }
 
     /// Usage rows, filtered by workspace/agent and since a ts.
@@ -383,8 +392,14 @@ impl Fleet {
     pub fn link_intake(&mut self, id: &str, graph_id: &str) -> Result<()> {
         if let Some(item) = self.state.intake.iter_mut().find(|i| i.id == id) {
             item.graph_id = Some(graph_id.to_owned());
+            // Journal-first (review C-2): the linked graph id must survive a
+            // restart like the row itself.
+            let record =
+                self.journal.append(JournalType::IntakeRecord, serde_json::to_value(item)?)?;
+            self.store.link_intake(id, graph_id)?;
+            self.store.journal_row(&record)?;
         }
-        self.store.link_intake(id, graph_id)
+        Ok(())
     }
 
     // --- read accessors ----------------------------------------------------
@@ -572,6 +587,25 @@ impl FleetState {
                     decision.outcome = Some(outcome.clone());
                 }
             }
+            JournalType::ProposalRecord => {
+                if let Ok(p) = serde_json::from_value::<Proposal>(record.data.clone()) {
+                    self.proposals.insert(p.id.clone(), p);
+                }
+            }
+            JournalType::IntakeRecord => {
+                // Upsert by id: a `link_intake` re-appends the same item with
+                // its graph_id set, so replay must replace, not duplicate.
+                if let Ok(item) = serde_json::from_value::<IntakeItem>(record.data.clone()) {
+                    if let Some(existing) = self.intake.iter_mut().find(|i| i.id == item.id) {
+                        *existing = item;
+                    } else {
+                        self.intake.push_back(item);
+                    }
+                }
+            }
+            // Usage is DB-only (queried via `usage_since`); `Store::apply`
+            // restores it from the same journal record.
+            JournalType::UsageRecord => {}
         }
         Ok(())
     }

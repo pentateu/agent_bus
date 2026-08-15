@@ -116,15 +116,32 @@ async fn spa_root(State(state): State<ApiState>) -> Response {
 /// Serve the built SPA deterministically: a real file under `~/.supervisor/ui`
 /// is served as-is; every other path (client-side routes) falls back to
 /// `index.html` (§2.2).
+///
+/// Security (review C-1): the path is constrained to the UI root. `..`
+/// segments and NUL bytes are rejected outright, and the resolved file is
+/// canonicalized and required to stay under the canonical UI root — so a
+/// request can never serve `api-token`, `secrets.json`, or any other file
+/// outside the bundle, even via `--path-as-is` or a symlink escape.
 async fn spa(State(state): State<ApiState>, Path(path): Path<String>) -> Response {
     let ui_dir = state.state_dir.join("ui");
-    let target = if path.is_empty() { ui_dir.join("index.html") } else { ui_dir.join(&path) };
-    let serve = if target.is_file() { target } else { ui_dir.join("index.html") };
-    let Ok(bytes) = tokio::fs::read(&serve).await else {
+    if path.split('/').any(|seg| seg == ".." || seg.contains('\0')) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let raw = if path.is_empty() { ui_dir.join("index.html") } else { ui_dir.join(&path) };
+    let file = if raw.is_file() { raw } else { ui_dir.join("index.html") };
+    let within_root = match (std::fs::canonicalize(&ui_dir), std::fs::canonicalize(&file)) {
+        (Ok(root), Ok(f)) => f.starts_with(&root),
+        _ => false,
+    };
+    if !within_root {
+        let message = "supervisor UI is not built yet — run `npm run build` in web/ and copy dist to ~/.supervisor/ui";
+        return (StatusCode::NOT_FOUND, message).into_response();
+    }
+    let Ok(bytes) = tokio::fs::read(&file).await else {
         let message = "supervisor UI is not built yet — run `npm run build` in web/ and copy dist to ~/.supervisor/ui";
         return (StatusCode::NOT_FOUND, message).into_response();
     };
-    let mime = mime_for(&serve);
+    let mime = mime_for(&file);
     axum::response::Response::builder()
         .header(header::CONTENT_TYPE, mime)
         .body(axum::body::Body::from(bytes))

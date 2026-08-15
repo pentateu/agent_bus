@@ -71,6 +71,26 @@ impl Receiver {
         })
     }
 
+    /// Receive for a service loop. A `Lagged` note (this subscriber fell
+    /// behind while its handler was busy) is logged and the wait retried —
+    /// the service resyncs instead of dying. `None` means the bus is closed
+    /// (the daemon is shutting down) and the service should exit.
+    /// Previously every service treated the first `Lagged` as fatal and
+    /// exited silently, killing delivery/ACK resolution until a manual
+    /// restart (review C-3).
+    #[must_use]
+    pub async fn recv_or_shutdown(&mut self) -> Option<BusEvent> {
+        loop {
+            match self.recv().await {
+                Ok(event) => return Some(event),
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!(dropped = n, "bus subscriber fell behind; resyncing");
+                }
+                Err(RecvError::Closed) | Err(RecvError::Empty) => return None,
+            }
+        }
+    }
+
     /// Try to take the next event without waiting.
     ///
     /// # Errors

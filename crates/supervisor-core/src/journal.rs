@@ -32,6 +32,13 @@ pub enum JournalType {
     RuleMerge,
     PortAlloc,
     PortFree,
+    /// C-2 (review): proposals must survive restarts (were written to the DB
+    /// without a journal entry and wiped by `Store::rebuild`).
+    ProposalRecord,
+    /// C-2 (review): intake items must survive restarts.
+    IntakeRecord,
+    /// C-2 (review): usage/cost rows must survive restarts (DB-only before).
+    UsageRecord,
 }
 
 impl JournalType {
@@ -50,6 +57,9 @@ impl JournalType {
             Self::RuleMerge => "rule.merge",
             Self::PortAlloc => "port.alloc",
             Self::PortFree => "port.free",
+            Self::ProposalRecord => "proposal.record",
+            Self::IntakeRecord => "intake.record",
+            Self::UsageRecord => "usage.record",
         }
     }
 
@@ -68,6 +78,9 @@ impl JournalType {
             "rule.merge" => Some(Self::RuleMerge),
             "port.alloc" => Some(Self::PortAlloc),
             "port.free" => Some(Self::PortFree),
+            "proposal.record" => Some(Self::ProposalRecord),
+            "intake.record" => Some(Self::IntakeRecord),
+            "usage.record" => Some(Self::UsageRecord),
             _ => None,
         }
     }

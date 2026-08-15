@@ -84,13 +84,13 @@ impl WorkflowRunner {
             tokio::select! {
                 () = self.shutdown.cancelled() => return,
                 () = tokio::time::sleep(TIMEOUT_SWEEP) => self.sweep_timeouts().await,
-                event = rx.recv() => {
+                event = rx.recv_or_shutdown() => {
                     match event {
-                        Ok(BusEvent::Human(HumanEvent::Command { command, args })) => {
+                        Some(BusEvent::Human(HumanEvent::Command { command, args })) => {
                             self.on_command(&command, &args).await;
                         }
-                        Ok(event) => self.handle(event).await,
-                        Err(_) => return,
+                        Some(event) => self.handle(event).await,
+                        None => return,
                     }
                 }
             }

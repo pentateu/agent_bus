@@ -61,13 +61,6 @@ async fn run() -> Result<()> {
         .server_password;
     let token = load_or_create_token(&token_path(&state_dir)).context("loading API token")?;
 
-    // Record our PID so `supervisor stop` can signal the daemon properly
-    // (no pgrep, no guessing — the CLI reads this file).
-    if let Err(e) = std::fs::write(state_dir.join("supervisor.pid"), std::process::id().to_string())
-    {
-        tracing::warn!(error = %e, "cannot write supervisor.pid");
-    }
-
     // 2. Ensure default graphs are installed.
     ensure_default_graphs(&fleet).await?;
 
@@ -266,6 +259,14 @@ async fn run() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", config.supervisor.api_port))
         .await
         .with_context(|| format!("binding API on {}", config.supervisor.api_port))?;
+    // Record our PID only AFTER the bind succeeds: a second instance that
+    // fails to bind must not clobber the healthy daemon's pid file (caught
+    // live — two daemons collided on the port and the pid file pointed at the
+    // dead one, so `supervisor stop` could not find the real process).
+    if let Err(e) = std::fs::write(state_dir.join("supervisor.pid"), std::process::id().to_string())
+    {
+        tracing::warn!(error = %e, "cannot write supervisor.pid");
+    }
     tracing::info!(port = config.supervisor.api_port, "supervisor API listening");
     // Serve until SIGINT/SIGTERM, then give in-flight connections a short
     // drain window before proceeding to cleanup. A hard grace is required:

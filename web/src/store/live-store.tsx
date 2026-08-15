@@ -8,6 +8,7 @@ import { streamEvents } from "../api/sse";
 import { initialLiveState, reduce, type LiveState } from "./reduce";
 
 const LiveContext = createContext<LiveState | null>(null);
+const ClearPermissionContext = createContext<(ws: string, agent: string) => void>(() => {});
 
 export function LiveProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<LiveState>(initialLiveState);
@@ -17,26 +18,47 @@ export function LiveProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
+    // I-24: unmount must abort the SSE stream — a `cancelled` flag alone
+    // leaves the generator's reconnect loop running forever.
+    const controller = new AbortController();
     const pump = async () => {
-      for await (const event of streamEvents()) {
-        if (cancelled) return;
+      for await (const event of streamEvents(controller.signal)) {
         setState((prev) => reduce(prev, event));
       }
     };
     void pump();
     return () => {
-      cancelled = true;
+      controller.abort();
     };
   }, []);
 
   void useMemo(() => state, [state]);
 
-  return <LiveContext.Provider value={state}>{children}</LiveContext.Provider>;
+  return (
+    <LiveContext.Provider value={state}>
+      <ClearPermissionContext.Provider
+        value={(ws, agent) =>
+          setState((prev) => {
+            const perWs = { ...prev.permissionPending[ws] };
+            delete perWs[agent];
+            return { ...prev, permissionPending: { ...prev.permissionPending, [ws]: perWs } };
+          })
+        }
+      >
+        {children}
+      </ClearPermissionContext.Provider>
+    </LiveContext.Provider>
+  );
 }
 
 export function useLive(): LiveState {
   const state = useContext(LiveContext);
   if (!state) throw new Error("useLive must be used within LiveProvider");
   return state;
+}
+
+/** I-27: clear a resolved/denied permission banner (the signal stream has no
+ * "permission resolved" event, so the UI clears on mutation success). */
+export function useClearPermission(): (ws: string, agent: string) => void {
+  return useContext(ClearPermissionContext);
 }

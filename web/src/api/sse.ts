@@ -2,7 +2,7 @@
 // `Authorization` header, so we hand-roll the parser (~60 lines) over `fetch`
 // with the in-memory bearer token.
 
-import { getToken, hasToken } from "./client";
+import { getToken, hasToken, setToken } from "./client";
 import type { BusEvent } from "./types";
 
 /** Parse one SSE frame (`event:` + joined `data:` lines) from a chunk. */
@@ -50,12 +50,19 @@ export function frameToBusEvent(frame: SseFrame): BusEvent | null {
 
 /**
  * Stream SSE events from `/api/v1/events` as an async iterator, reconnecting
- * with backoff on error/EOF. Callers `break` out of the loop to stop.
+ * with backoff on error/EOF. Callers `break` out of the loop to stop, or pass
+ * an `AbortSignal` — an unmounted subscriber must actually release the
+ * connection (I-24: previously every StrictMode/HMR remount leaked a
+ * reconnecting zombie that survived daemon restarts).
  */
-export async function* streamEvents(): AsyncGenerator<BusEvent> {
+export async function* streamEvents(signal?: AbortSignal): AsyncGenerator<BusEvent> {
   if (!hasToken()) return;
   let backoff = 1000;
   for (;;) {
+    if (signal?.aborted) return;
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    signal?.addEventListener("abort", onAbort);
     try {
       const res = await fetch("/api/v1/events", {
         // The events endpoint is bearer-authed like every /api/v1 route; the
@@ -65,8 +72,17 @@ export async function* streamEvents(): AsyncGenerator<BusEvent> {
           Accept: "text/event-stream",
           ...(getToken() ? { Authorization: `Bearer ${getToken()}` } : {}),
         },
+        signal: controller.signal,
       });
-      if (!res.ok || !res.body) throw new Error(`events ${res.status}`);
+      if (!res.ok || !res.body) {
+        if (res.status === 401) {
+          // I-25: a revoked token must stop the reconnect loop, not spin on
+          // 401s forever.
+          setToken(null);
+          return;
+        }
+        throw new Error(`events ${res.status}`);
+      }
       backoff = 1000;
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -85,8 +101,11 @@ export async function* streamEvents(): AsyncGenerator<BusEvent> {
         }
       }
     } catch {
-      // fall through to reconnect
+      // fall through to reconnect unless aborted
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
     }
+    if (signal?.aborted) return;
     await new Promise((r) => setTimeout(r, backoff));
     backoff = Math.min(backoff * 2, 30_000);
   }

@@ -22,13 +22,20 @@ function useGraphNodeStates(graphId: string): Record<string, import("../api/type
 function Editor({ graph }: { graph: GraphDef }) {
   const [edit, setEdit] = useState<GraphDef>(graph);
   const [selected, setSelected] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const issues: GraphIssue[] = validateGraph(edit);
   const nodeStates = useGraphNodeStates(graph.id);
   const running = Object.values(nodeStates).some((s) => s === "running");
 
   const save = async () => {
-    const result = await api.saveGraph(edit.id, JSON.stringify(edit, null, 2));
-    void result;
+    setSaveError(null);
+    try {
+      await api.saveGraph(edit.id, JSON.stringify(edit, null, 2));
+    } catch (e) {
+      // I-28: a failed save must not be silent (a daemon restart mid-edit
+      // used to make the button do nothing).
+      setSaveError(`save failed: ${(e as Error).message}`);
+    }
   };
 
   const selectedNode = edit.nodes.find((n) => n.id === selected);
@@ -47,6 +54,11 @@ function Editor({ graph }: { graph: GraphDef }) {
         {running && <span className="badge-running">running — save applies to the next run</span>}
         {issues.length > 0 && (
           <span className="issues">{issues.map((i) => i.message).join("; ")}</span>
+        )}
+        {saveError && (
+          <span className="issues" role="alert">
+            {saveError}
+          </span>
         )}
       </div>
 

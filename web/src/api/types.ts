@@ -122,7 +122,9 @@ export interface TranscriptMessage {
   role: string;
   ts: string;
   text: string;
-  usage?: { prompt_tokens: number; completion_tokens: number } | null;
+  // I-29: the driver serializes usage as camelCase (promptTokens /
+  // completionTokens) — the wire, not snake_case.
+  usage?: { promptTokens: number; completionTokens: number } | null;
 }
 
 export interface DecisionRecord {

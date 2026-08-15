@@ -21,7 +21,7 @@ import "@xyflow/react/dist/style.css";
 
 import type { AgentState, GraphDef, NodeDef, NodeState } from "../api/types";
 import { layoutGraph } from "../lib/layout";
-import { connect, disconnect } from "../lib/graph-edit";
+import { connect, disconnect, removeNode } from "../lib/graph-edit";
 
 const ROLE_GLYPH: Record<string, string> = {
   dev: "⚙️",
@@ -141,6 +141,18 @@ export function WorkflowCanvas(props: WorkflowCanvasProps) {
     if (!onChange || !conn.source || !conn.target) return;
     onChange(connect(graph, conn.target, conn.source));
   };
+  // C-6: backspace removal used to update only React Flow's internal state —
+  // the parent graph kept the node, it reappeared on the next re-seed, and
+  // save persisted the "deleted" node. Route `remove` changes to onChange.
+  const onNodesChangeEdit: import("@xyflow/react").OnNodesChange<Node<CardData>> = (changes) => {
+    onNodesChange(changes);
+    if (!onChange) return;
+    for (const change of changes) {
+      if (change.type === "remove" && change.id) {
+        onChange(removeNode(graph, change.id));
+      }
+    }
+  };
   const onEdgesDeleteEdit = (deleted: Edge[]) => {
     if (!onChange) return;
     let next = graph;
@@ -157,7 +169,7 @@ export function WorkflowCanvas(props: WorkflowCanvasProps) {
         nodes={live ? liveNodes : nodes}
         edges={live ? liveEdges : edges}
         nodeTypes={nodeTypes}
-        onNodesChange={live ? undefined : onNodesChange}
+        onNodesChange={live ? undefined : onNodesChangeEdit}
         onEdgesChange={live ? undefined : onEdgesChange}
         onConnect={live ? undefined : onConnectEdit}
         onEdgesDelete={live ? undefined : onEdgesDeleteEdit}

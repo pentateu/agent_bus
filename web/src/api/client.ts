@@ -41,7 +41,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { ...(init?.headers as Record<string, string>) };
   if (token) headers.Authorization = `Bearer ${token}`;
   const res = await fetch(path, { ...init, headers });
-  if (res.status === 401) throw new ApiError(401, "unauthorized — run `supervisor web`");
+  if (res.status === 401) {
+    // I-25: a rotated/revoked token must surface the missing-token screen,
+    // not a misleading "No workspaces yet" dashboard. Clear the in-memory
+    // token; the app re-renders the gate.
+    setToken(null);
+    throw new ApiError(401, "unauthorized — run `supervisor web`");
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new ApiError(res.status, body || res.statusText);

@@ -1,13 +1,15 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { api } from "../api/endpoints";
-import { useLive } from "../store/live-store";
+import { useClearPermission, useLive } from "../store/live-store";
 import type { TranscriptMessage } from "../api/types";
 
 export function AgentDialog({ ws, agent }: { ws: string; agent: string }) {
   const live = useLive();
+  const clearPermission = useClearPermission();
   const [compose, setCompose] = useState("");
   const [high, setHigh] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const { data: agents } = useQuery({ queryKey: ["agents", ws], queryFn: () => api.agents(ws) });
   const meta = (agents ?? []).find((a) => a.agent_id === agent);
@@ -22,12 +24,22 @@ export function AgentDialog({ ws, agent }: { ws: string; agent: string }) {
 
   const send = useMutation({
     mutationFn: (body: string) => api.sendMessage(ws, agent, body, high ? "high" : "normal"),
+    // I-28: mutation failures must not be silent.
+    onError: (e) => setError(`send failed: ${(e as Error).message}`),
   });
-  const abort = useMutation({ mutationFn: () => api.abortAgent(ws, agent) });
-  const attach = useMutation({ mutationFn: () => api.attachAgent(ws, agent) });
+  const abort = useMutation({
+    mutationFn: () => api.abortAgent(ws, agent),
+    onError: (e) => setError(`abort failed: ${(e as Error).message}`),
+  });
+  const attach = useMutation({
+    mutationFn: () => api.attachAgent(ws, agent),
+    onError: (e) => setError(`attach failed: ${(e as Error).message}`),
+  });
   const permission = useMutation({
     mutationFn: ({ pid, allow }: { pid: string; allow: boolean }) =>
       api.respondPermission(ws, agent, pid, allow ? "allow" : "deny", true),
+    onSuccess: () => clearPermission(ws, agent), // I-27: no stale banner
+    onError: (e) => setError(`permission response failed: ${(e as Error).message}`),
   });
 
   const rows = (transcript ?? []) as TranscriptMessage[];
@@ -56,6 +68,13 @@ export function AgentDialog({ ws, agent }: { ws: string; agent: string }) {
           <strong>Permission requested</strong> ({pendingPermission})
           <button onClick={() => permission.mutate({ pid: pendingPermission, allow: true })}>Allow</button>
           <button onClick={() => permission.mutate({ pid: pendingPermission, allow: false })}>Deny</button>
+        </div>
+      )}
+
+      {error && (
+        <div className="permission-banner" role="alert">
+          <strong>{error}</strong>
+          <button onClick={() => setError(null)}>dismiss</button>
         </div>
       )}
 

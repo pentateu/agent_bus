@@ -74,6 +74,17 @@ function WorkspaceCard({ ws }: { ws: string }) {
   const current = running.find((g) => g.id === activeGraph) ?? running[0];
   const state = live.workspaceStates[ws] ?? "off";
   const triage = agentList.filter((a) => a.state === "waiting_input" || a.state === "blocked_permission");
+  // I-28: lifecycle mutations must surface failures, not vanish.
+  const [wsError, setWsError] = useState<string | null>(null);
+  const toggle = async (next: "on" | "off") => {
+    setWsError(null);
+    try {
+      if (next === "on") await api.workspaceOn(ws);
+      else await api.workspaceOff(ws, true);
+    } catch (e) {
+      setWsError(`${next} failed: ${(e as Error).message}`);
+    }
+  };
 
   return (
     <div className={`ws-card ws-${state}`}>
@@ -82,9 +93,14 @@ function WorkspaceCard({ ws }: { ws: string }) {
           {ws}
         </a>
         <span className="ws-state">{state}</span>
-        {state === "off" && <button onClick={() => void api.workspaceOn(ws)}>on</button>}
-        {state === "on" && <button onClick={() => void api.workspaceOff(ws, true)}>off</button>}
+        {state === "off" && <button onClick={() => void toggle("on")}>on</button>}
+        {state === "on" && <button onClick={() => void toggle("off")}>off</button>}
       </div>
+      {wsError && (
+        <div className="ws-triage" role="alert">
+          {wsError}
+        </div>
+      )}
       <div className="ws-agents">
         {agentList.map((a) => (
           <a key={a.agent_id} href={`#/workspaces/${ws}/agents/${a.agent_id}`}>

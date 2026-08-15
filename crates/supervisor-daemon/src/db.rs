@@ -329,12 +329,12 @@ impl Store {
     pub fn upsert_workspace(&self, ws: &Workspace) -> Result<()> {
         let conn = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         conn.execute(
-            r"INSERT INTO workspace (id, path, port, state, cmux_ws, layout_path, updated_at)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            r"INSERT INTO workspace (id, path, port, state, cmux_ws, layout_path, server_pid, updated_at)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                ON CONFLICT(id) DO UPDATE SET
                  path = excluded.path, port = excluded.port, state = excluded.state,
                  cmux_ws = excluded.cmux_ws, layout_path = excluded.layout_path,
-                 updated_at = excluded.updated_at",
+                 server_pid = excluded.server_pid, updated_at = excluded.updated_at",
             params![
                 ws.id,
                 ws.path,
@@ -342,6 +342,7 @@ impl Store {
                 ws.state.to_db(),
                 ws.cmux_ws,
                 ws.layout_path,
+                ws.server_pid,
                 ws.updated_at,
             ],
         )

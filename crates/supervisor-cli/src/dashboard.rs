@@ -19,6 +19,13 @@ const REFRESH: Duration = Duration::from_secs(2);
 /// # Errors
 /// Terminal setup failures.
 pub fn run(config: crate::client::ClientConfig) -> Result<()> {
+    // Panic hook: restore the terminal before the process dies, so a panic
+    // leaves a usable shell, not a raw-mode terminal (review minor).
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        original_hook(info);
+    }));
     let client = ApiClient::new(config)?;
     let mut terminal = ratatui::init();
     let result = run_loop(&mut terminal, &client);

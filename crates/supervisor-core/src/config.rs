@@ -14,12 +14,56 @@ use crate::rules::DEFAULT_THRESHOLD;
 use crate::types::{AgentMode, DriverKind, RosterAgent};
 
 /// How the project's `[server] port` is configured.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum PortSetting {
     Fixed(u16),
     /// `"auto"` → the allocator picks.
     Auto(String),
+}
+
+impl<'de> serde::Deserialize<'de> for PortSetting {
+    /// Untagged parsing silently turned a quoted `port = "4200"` into `Auto`
+    /// (the allocator then picked a random port). Accept an integer, `"auto"`,
+    /// or a quoted number; reject anything else loudly.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PortVisitor;
+        impl serde::de::Visitor<'_> for PortVisitor {
+            type Value = PortSetting;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an integer port, \"auto\", or a quoted port number")
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                u16::try_from(v).map(PortSetting::Fixed).map_err(serde::de::Error::custom)
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                u16::try_from(v).map(PortSetting::Fixed).map_err(serde::de::Error::custom)
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v == "auto" {
+                    Ok(PortSetting::Auto(v.to_owned()))
+                } else {
+                    v.parse::<u16>().map(PortSetting::Fixed).map_err(|_| {
+                        serde::de::Error::custom(format!(
+                            "port must be a number or \"auto\", got {v:?}"
+                        ))
+                    })
+                }
+            }
+        }
+        deserializer.deserialize_any(PortVisitor)
+    }
 }
 
 /// The `[project]` section of a project's `supervisor.toml`.

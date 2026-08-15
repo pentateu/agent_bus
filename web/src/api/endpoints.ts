@@ -67,7 +67,13 @@ export const api = {
   rejectProposal: (id: string) => post(`/api/v1/bakeback/proposals/${encodeURIComponent(id)}/reject`),
 };
 
-/** Parse a stored graph JSON into a GraphDef (handles missing fields). */
+/** Parse a stored graph JSON into a GraphDef (handles missing fields and
+ * malformed data without crashing the page — review minor). */
 export function parseGraph(data: string): GraphDef {
-  return JSON.parse(data) as GraphDef;
+  try {
+    const value = JSON.parse(data) as Partial<GraphDef>;
+    return { id: value.id ?? "", name: value.name ?? "", nodes: value.nodes ?? [] };
+  } catch {
+    return { id: "", name: "", nodes: [] };
+  }
 }

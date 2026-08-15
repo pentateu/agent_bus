@@ -374,9 +374,12 @@ async fn attach_agent(
 async fn agent_messages(
     State(state): State<ApiState>,
     Path((ws, agent)): Path<(String, String)>,
-    Query(q): Query<SinceQuery>,
+    Query(q): Query<MessagesQuery>,
 ) -> Response {
-    let limit = q.since.as_deref().and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
+    // `?limit=` controls how many transcript rows come back (the previous
+    // code read `since` and used it as the limit — a since-timestamp silently
+    // became a row count).
+    let limit = q.limit.unwrap_or(50).min(200);
     let (driver, agent_ref) = match state.drivers.for_agent(&ws, &agent).await {
         Ok(pair) => pair,
         Err(e) => return ApiError { error: e.to_string() }.into_response(),
@@ -388,6 +391,11 @@ async fn agent_messages(
         },
         Err(e) => ApiError { error: e.to_string() }.into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct MessagesQuery {
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -403,12 +411,25 @@ async fn respond_permission(
     Path((ws, agent, pid)): Path<(String, String, String)>,
     Json(body): Json<PermissionBody>,
 ) -> Response {
-    let allow = body.response == "allow";
+    // A typo'd response must not silently deny (review minor).
+    let allow = match body.response.as_str() {
+        "allow" => true,
+        "deny" => false,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: format!("response must be \"allow\" or \"deny\", got {other:?}"),
+                }),
+            )
+                .into_response();
+        }
+    };
     let (driver, agent_ref) = match state.drivers.for_agent(&ws, &agent).await {
         Ok(pair) => pair,
         Err(e) => return ApiError { error: e.to_string() }.into_response(),
     };
-    match driver.respond_permission(&agent_ref, &pid, allow).await {
+    match driver.respond_permission(&agent_ref, &pid, allow, body.remember).await {
         Ok(()) => Json(serde_json::json!({ "permission": pid, "response": body.response, "remember": body.remember }))
             .into_response(),
         Err(e) => ApiError { error: e.to_string() }.into_response(),
@@ -500,11 +521,22 @@ fn validate_graph_put(path_id: &str, raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn delete_graph(State(_state): State<ApiState>, Path(id): Path<String>) -> Response {
-    // Graphs are not deleted today (the projection keeps history); deactivate.
-    let _ = id;
-    Json(serde_json::json!({ "deleted": false, "note": "graphs are deactivated, not deleted" }))
-        .into_response()
+async fn delete_graph(State(state): State<ApiState>, Path(id): Path<String>) -> Response {
+    // Graphs keep their history; DELETE deactivates the graph (stops it from
+    // being offered to new runs) rather than pretending a 200 that deletes
+    // nothing (review minor).
+    let mut fleet = state.fleet.lock().await;
+    let Some(mut graph) = fleet.graph(&id).cloned() else {
+        return (StatusCode::NOT_FOUND, Json(ApiError { error: format!("unknown graph {id:?}") }))
+            .into_response();
+    };
+    graph.active = false;
+    graph.updated_at = now_rfc3339();
+    match fleet.upsert_graph(&graph) {
+        Ok(_) => Json(serde_json::json!({ "graph": id, "deleted": true, "deactivated": true }))
+            .into_response(),
+        Err(e) => ApiError { error: e.to_string() }.into_response(),
+    }
 }
 
 #[derive(Deserialize)]

@@ -204,7 +204,8 @@ impl RuleService {
                     // The permission belongs to whichever session asked; the
                     // situation's agent session is the safe target.
                     if let Some(session) = self.agent_session(&sit.ws, &sit.agent).await {
-                        let _ = client.respond_permission(&session, &permission_id, allow).await;
+                        let _ =
+                            client.respond_permission(&session, &permission_id, allow, false).await;
                     }
                 }
             }

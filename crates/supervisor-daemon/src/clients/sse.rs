@@ -222,9 +222,15 @@ impl SseObserver {
         let mut parser = SseParser::default();
         let mut last_heartbeat = tokio::time::Instant::now();
         loop {
+            // Fixed deadline from the last heartbeat, NOT a fresh sleep each
+            // iteration: a fresh sleep(90s) restarted on every chunk, so any
+            // non-heartbeat traffic kept the stream alive forever and the
+            // watchdog never fired ("90s total silence" was the real
+            // contract; now it is genuinely "90s without a heartbeat").
+            let heartbeat_deadline = last_heartbeat + Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
             tokio::select! {
                 () = self.shutdown.cancelled() => return,
-                () = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)) => {
+                () = tokio::time::sleep_until(heartbeat_deadline) => {
                     if last_heartbeat.elapsed() > Duration::from_secs(HEARTBEAT_TIMEOUT_SECS) {
                         tracing::warn!(ws = %self.ws, "sse heartbeat timeout; forcing reconnect");
                         return;

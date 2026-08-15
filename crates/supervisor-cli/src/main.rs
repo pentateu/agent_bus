@@ -5,6 +5,7 @@
 //! Exit codes (§4.15): 0 success, 1 usage, 2 target not found, 3 daemon
 //! unreachable.
 
+use std::os::unix::process::CommandExt as _;
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
@@ -223,8 +224,11 @@ fn run(cli: &Cli) -> Result<()> {
 fn spawn_daemon() -> Result<()> {
     let daemon_bin =
         std::env::var("SUPERVISOR_DAEMON_BIN").unwrap_or_else(|_| "supervisor-daemon".to_owned());
-    let status = std::process::Command::new(&daemon_bin).status()?;
-    std::process::exit(status.code().unwrap_or(1));
+    // exec, not spawn: the CLI process BECOMES the daemon, so signals sent to
+    // it (e.g. a targeted `kill -TERM` from `supervisor stop`) reach the real
+    // daemon instead of orphaning a child (review minor).
+    let err = std::process::Command::new(&daemon_bin).exec();
+    Err(anyhow::anyhow!("failed to exec {daemon_bin}: {err}"))
 }
 
 fn status(cli: &Cli) -> Result<()> {
@@ -341,7 +345,10 @@ fn stop(cli: &Cli) -> Result<()> {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            anyhow::bail!("daemon did not stop within 30s (check ~/.supervisor/daemon.log)");
+            anyhow::bail!(
+                "daemon did not stop within 60s (check {}/daemon.log)",
+                state_dir.display()
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }

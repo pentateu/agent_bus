@@ -302,9 +302,18 @@ async fn run() -> Result<()> {
     workspaces.shutdown().await;
     // F5: tear down the supervisor workspace server on shutdown. Covers both
     // the spawned child and an adopted server (adopt path records the PID in
-    // the pid file but returns no child handle).
+    // the pid file but returns no child handle). SIGTERM first, then SIGKILL
+    // after a grace (review minor — `child.kill()` was an immediate SIGKILL).
     if let Some(mut child) = supervisor_serve {
-        let _ = child.kill().await;
+        if let Some(pid) = child.id() {
+            let _ = tokio::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status()
+                .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
+        }
+        child.start_kill().ok();
+        let _ = child.wait().await;
     }
     if let Ok(pid) = std::fs::read_to_string(state_dir.join(SUPERVISOR_SERVE_PID))
         && let Ok(pid) = pid.trim().parse::<u32>()

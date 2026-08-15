@@ -114,7 +114,8 @@ impl CmuxClient for ProcessCmux {
         let output = self
             .run(&["new-workspace", "--name", name, "--cwd", &cwd.to_string_lossy(), "--json"])
             .await?;
-        let handle = extract_handle(&Self::stdout(&output), "workspace");
+        let handle = extract_handle(&Self::stdout(&output), "workspace")
+            .ok_or_else(|| anyhow::anyhow!("cmux new-workspace returned no workspace handle"))?;
         let mut cache = self.workspaces.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.insert(
             name.to_owned(),
@@ -136,7 +137,8 @@ impl CmuxClient for ProcessCmux {
                 "--json",
             ])
             .await?;
-        let handle = extract_handle(&Self::stdout(&output), "surface");
+        let handle = extract_handle(&Self::stdout(&output), "surface")
+            .ok_or_else(|| anyhow::anyhow!("cmux new-surface returned no surface handle"))?;
         Ok(handle)
     }
 
@@ -185,23 +187,23 @@ impl CmuxClient for ProcessCmux {
 ///
 /// cmux returns `{"surface_ref": "surface:45", "pane_ref": "pane:16", ...}`
 /// (or plain text `OK surface:46 pane:16 workspace:7`), so both the `*_ref`
-/// keys and the trailing `kind:N` tokens are candidates.
+/// Extract a handle from cmux output: prefer JSON `*_ref`/`id` fields, then
+/// the first whitespace-separated token of the requested kind (e.g.
+/// `surface:46`). Returns `None` when no handle is present — callers must
+/// fail loudly rather than inventing a bogus `{kind}:0` (review minor).
 #[must_use]
-pub fn extract_handle(output: &str, kind: &str) -> CmuxHandle {
+pub fn extract_handle(output: &str, kind: &str) -> Option<CmuxHandle> {
     // Prefer JSON `*_ref` / `id` fields.
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(output) {
         for key in ["id", "surface_ref", "pane_ref", "workspace_ref", "window_ref"] {
             if let Some(handle) = value.get(key).and_then(serde_json::Value::as_str) {
-                return handle.to_owned();
+                return Some(handle.to_owned());
             }
         }
     }
     // Fallback: the first whitespace-separated token of the requested kind,
     // e.g. `surface:46` for a new-surface call.
-    output
-        .split_whitespace()
-        .find(|s| s.starts_with(&format!("{kind}:")))
-        .map_or_else(|| format!("{kind}:0"), str::to_owned)
+    output.split_whitespace().find(|s| s.starts_with(&format!("{kind}:"))).map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -212,24 +214,30 @@ mod tests {
     fn handle_extraction_prefers_json_id() {
         assert_eq!(
             extract_handle(r#"{"id":"workspace:7","name":"iot"}"#, "workspace"),
-            "workspace:7"
+            Some("workspace:7".to_owned())
         );
     }
 
     #[test]
     fn handle_extraction_reads_surface_ref() {
         let out = r#"{"pane_ref":"pane:16","surface_ref":"surface:45","type":"terminal","window_ref":"window:1","workspace_ref":"workspace:7"}"#;
-        assert_eq!(extract_handle(out, "surface"), "surface:45");
+        assert_eq!(extract_handle(out, "surface"), Some("surface:45".to_owned()));
     }
 
     #[test]
     fn handle_extraction_falls_back_to_text_token() {
-        assert_eq!(extract_handle("OK surface:46 pane:16 workspace:7\n", "surface"), "surface:46");
-        assert_eq!(extract_handle("created workspace:7\n", "workspace"), "workspace:7");
+        assert_eq!(
+            extract_handle("OK surface:46 pane:16 workspace:7\n", "surface"),
+            Some("surface:46".to_owned())
+        );
+        assert_eq!(
+            extract_handle("created workspace:7\n", "workspace"),
+            Some("workspace:7".to_owned())
+        );
     }
 
     #[test]
     fn handle_extraction_defaults() {
-        assert_eq!(extract_handle("(no output)", "workspace"), "workspace:0");
+        assert_eq!(extract_handle("(no output)", "workspace"), None, "no bogus surface:0 fallback");
     }
 }

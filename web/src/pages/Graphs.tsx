@@ -7,11 +7,12 @@ import type { GraphDef, NodeDef } from "../api/types";
 
 const ROLE_PALETTE = ["dev", "reviewer", "tester", "designer", "memory-keeper"];
 
-function useGraphNodeStates(graphId: string): Record<string, import("../api/types").NodeState> {
+function useGraphNodeStates(graphId: string | undefined): Record<string, import("../api/types").NodeState> {
   const { data } = useQuery({
     queryKey: ["graphNodes", graphId],
-    queryFn: () => api.graphNodes(undefined, graphId),
+    queryFn: () => api.graphNodes(graphId ?? undefined, graphId ?? ""),
     refetchInterval: 2000,
+    enabled: !!graphId,
   });
   return (data ?? []).reduce<Record<string, import("../api/types").NodeState>>((acc, row) => {
     acc[row.node_id] = row.state;
@@ -137,19 +138,26 @@ export function Graphs({ id }: { id?: string }) {
   const { data: graphs } = useQuery({ queryKey: ["graphs"], queryFn: api.graphs, refetchInterval: 5000 });
   const selected = (graphs ?? []).find((g) => g.id === id);
   const selectedGraph = selected ? parseGraph(selected.data) : null;
-  const liveNodes = useGraphNodeStates(id ?? "");
+  // Never fire `GET /graphs//nodes` when no graph is selected (review minor).
+  const liveNodes = useGraphNodeStates(id ? id : undefined);
 
   return (
     <div className="page">
       <h1>graphs</h1>
       <ul className="graph-list">
-        {(graphs ?? []).map((g) => (
-          <li key={g.id}>
-            <a href={`#/graphs/${g.id}`}>
-              {g.id} <span className="dim">v{g.version} · {JSON.parse(g.data).nodes.length} nodes</span>
-            </a>
-          </li>
-        ))}
+        {(graphs ?? []).map((g) => {
+          const parsed = parseGraph(g.data);
+          return (
+            <li key={g.id}>
+              <a href={`#/graphs/${g.id}`}>
+                {g.id}{" "}
+                <span className="dim">
+                  v{g.version} · {parsed.nodes.length} nodes
+                </span>
+              </a>
+            </li>
+          );
+        })}
       </ul>
 
       {selectedGraph && id && (

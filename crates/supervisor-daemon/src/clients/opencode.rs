@@ -216,6 +216,7 @@ impl OpencodeClient {
         id: &str,
         permission_id: &str,
         allow: bool,
+        remember: bool,
     ) -> Result<()> {
         let url = self
             .base
@@ -224,7 +225,11 @@ impl OpencodeClient {
         let res = self
             .client
             .post(url)
-            .json(&serde_json::json!({ "response": if allow { "allow" } else { "deny" } }))
+            // `remember` was previously dropped before the opencode call.
+            .json(&serde_json::json!({
+                "response": if allow { "allow" } else { "deny" },
+                "remember": remember,
+            }))
             .send()
             .await
             .context("POST permission")?;
@@ -398,9 +403,10 @@ impl AgentDriver for OpencodeDriver {
         a: &AgentRef,
         permission_id: &str,
         allow: bool,
+        remember: bool,
     ) -> Result<()> {
         self.client
-            .respond_permission(&a.session_id, permission_id, allow)
+            .respond_permission(&a.session_id, permission_id, allow, remember)
             .await
             .with_context(|| format!("permission response for {}/{}", a.ws, a.agent))
     }

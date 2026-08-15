@@ -105,12 +105,14 @@ pub trait AgentDriver: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Respond to a tool-permission prompt. Default: unsupported.
+    /// Respond to a tool-permission prompt. Default: unsupported. `remember`
+    /// asks the harness to remember the choice for that tool.
     async fn respond_permission(
         &self,
         _a: &AgentRef,
         _permission_id: &str,
         _allow: bool,
+        _remember: bool,
     ) -> anyhow::Result<()> {
         anyhow::bail!("this driver does not support automated permission responses")
     }

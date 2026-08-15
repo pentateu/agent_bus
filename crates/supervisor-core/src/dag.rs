@@ -283,6 +283,9 @@ impl Workflow {
     /// criterion, or a human gate whose `loop_back` targets do not exist.
     pub fn new(graph: GraphDef) -> CoreResult<Self> {
         let err = |reason: String| CoreError::InvalidGraph { id: graph.id.clone(), reason };
+        if graph.nodes.is_empty() {
+            return Err(err("a workflow must have at least one node".to_owned()));
+        }
         let mut ids = HashSet::new();
         for node in &graph.nodes {
             if node.id.is_empty() {
